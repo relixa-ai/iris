@@ -47,6 +47,8 @@ def featurize(features, A, B, candidates, output_col='feature_vectors', fill_na=
               validate=True, timezone=None, out=None, workers=None):
     """Return the feature vector and score of every candidate pair, as pandas or as a
     dataset of Parquet parts."""
+    from ..io import ONE_TABLE_MESSAGE
+
     tz = resolve_timezone(timezone)
     if validate:
         from ..io import check_candidates
@@ -79,9 +81,12 @@ def featurize(features, A, B, candidates, output_col='feature_vectors', fill_na=
             b_ids = _store_ids(store_b)
             pairs_dir = os.path.join(tmp, 'pairs')
             os.makedirs(pairs_dir)
-            parts, repeats = cand_mod.canonical(candidates, b_ids, pairs_dir, workers)
+            parts, repeats, n_self = cand_mod.canonical(candidates, b_ids, pairs_dir,
+                                                        workers, one_table=B is None)
             del b_ids
-            if validate and repeats:
+            if validate and B is None and (repeats or n_self):
+                log.warning(ONE_TABLE_MESSAGE.format(n_self=n_self, repeats=repeats))
+            elif validate and repeats:
                 log.warning(f'featurize: {repeats:,} of {n_listed:,} candidate pairs are '
                             f'repeats and are dropped; each distinct pair is featurized '
                             f'once')

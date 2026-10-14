@@ -22,6 +22,7 @@ from .tools import (
     save_features,
     load_features,
     save_data,
+    save_predictions,
     load_data,
     read_table,
     read_pairs,
@@ -57,7 +58,7 @@ from .io import (
     check_gold_data,
 )
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 __all__ = [
 
@@ -66,7 +67,7 @@ __all__ = [
     'create_features', 'featurize', 'down_sample', 'create_seeds', 'label_al',
     'label_pairs', 'train_matcher', 'apply_matcher', 'evaluate', 'clean_candidates',
     'get_base_sim_functions', 'get_base_tokenizers', 'get_extra_tokenizers',
-    'save_features', 'load_features', 'save_data', 'load_data', 'read_table', 'read_pairs',
+    'save_features', 'load_features', 'save_data', 'save_predictions', 'load_data', 'read_table', 'read_pairs',
 
     'candidates_from_flat', 'candidates_from_result', 'write_flat_candidates',
 

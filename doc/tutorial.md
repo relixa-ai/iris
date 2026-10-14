@@ -72,7 +72,7 @@ The table below explains each call.
 | Call | Returns | What it does |
 | --- | --- | --- |
 | `read_table(path)` | `pandas.DataFrame` | Reads a table into memory. A table has an integer id column, `_id`. A file whose id column has another name is read with `id_col`, which renames it. |
-| `read_pairs(path)` | `pandas.DataFrame` | Reads a set of pairs into memory, as the columns `id1` and `id2`, which hold an `_id` of table A and of table B. `columns` names the file's id columns when they have other names. The labeled pairs are stored in the grouped form, with one row per record of B, and `read_pairs` turns them into one row per pair, with `with_label=True` reading their labels. |
+| `read_pairs(path)` | `pandas.DataFrame` | Reads a set of pairs into memory, as the columns `id1` and `id2`, which hold an `_id` of table A and of table B. The id columns `a_id` and `b_id`, and the other names that blockers give them, are recognised, and `columns` names the file's id columns when they have names that are not recognised. The labeled pairs are stored in the grouped form, with one row per record of B, and `read_pairs` turns them into one row per pair, with `with_label=True` reading their labels. |
 | `check_tables`, `check_candidates`, `check_gold_data`, `check_labeled_data` | a count of rows or pairs | Check the ids before any work starts, and raise an error that names the invalid ones. |
 | `create_features(table_a, table_b, columns, columns)` | `list[Feature]` | Selects the features for the four columns, 35 in all. Part 2 describes them. |
 | `featurize(features, table_a, table_b, pairs)` | `pandas.DataFrame` | Computes the feature vector and the score of each pair, in the columns `feature_vectors` and `score`. It is called twice, for the 550 labeled pairs and for the 114,700 candidate pairs. |
@@ -81,7 +81,7 @@ The table below explains each call.
 | `apply_matcher(matcher, fvs, 'feature_vectors', 'prediction', 'confidence')` | `pandas.DataFrame` | Adds to every candidate pair the prediction, 1.0 for a match and 0.0 for a non-match, and its confidence. |
 | `evaluate(predictions, gold)` | `dict` | Compares the predictions with the gold set and returns the precision, recall and F1 that the script printed, together with the counts and a threshold curve. |
 
-The 550 labeled pairs hold 218 matches. The matcher trained on them predicts the gold matches of the candidate set with a precision of 0.9857 and a recall of 0.9937. The script ends with `save_features` and `save_data`, which write the features and the predictions to `examples/out/passive/`.
+The 550 labeled pairs hold 218 matches. The matcher trained on them predicts the gold matches of the candidate set with a precision of 0.9857 and a recall of 0.9937. The script ends with `save_features` and `save_predictions`, which write the features and the predicted matches to `examples/out/passive/`. The file of matches has the columns `id1`, `id2` and `probability`, with one row per pair predicted to match.
 
 ### Part 2: The features that `create_features` selects
 
@@ -284,7 +284,7 @@ metrics = iris.evaluate(predictions, gold, dedup=True)
 | Call | Returns | What it does |
 | --- | --- | --- |
 | `configure(spill_dir=...)` | `None` | Sets `IRIS_SPILL_DIR`, the directory for the local engine's scratch files. By default they go to the system's temporary directory. |
-| `read_table(path, df_type='arrow')`, `read_pairs(path, df_type='arrow')` | `pyarrow.dataset.Dataset` | Open a Parquet file without reading it. The functions that receive it read it a chunk at a time. A CSV file, or one whose columns need renaming, is first written once as Parquet to the scratch directory. |
+| `read_table(path, df_type='arrow')`, `read_pairs(path, df_type='arrow')` | `pyarrow.dataset.Dataset` | Open a Parquet file without reading it. The functions that receive it read it a chunk at a time. A CSV, TSV or JSON Lines file, or one whose columns need renaming, is first written once as Parquet to the scratch directory. |
 | `check_candidates(candidates, table, table, dedup=True)` | `int` | The input check, with one table as both A and B. |
 | `clean_candidates(candidates, drop_self_pairs=True, canonicalize_mirrors=True)` | `pyarrow.dataset.Dataset` | Removes the pairs of a song with itself and keeps each pair in one order, with `id1` smaller than `id2`. The result is written to scratch files. |
 | `featurize(features, table, table, candidates, out=...)` | `pyarrow.dataset.Dataset` | Passing the same table object as A and B makes this a deduplication. Worker processes featurize the pairs and write the feature vectors to `out`, and the result reads them from there. |
@@ -395,11 +395,11 @@ As the tables and the candidate set grow, the workflow does not change, but the 
 ### What your files need
 
 - *An id column.* Both tables need an id column of unique integers. `read_table` reads it as `_id`, and `id_col` names it when it has another name. Every id in the candidate set and the gold set must exist in its table. The `check_*` functions verify this before any work starts and raise an error that names the ids that do not.
-- *Candidate pairs.* A flat set with one column of table A's ids and one of table B's, or the grouped form with one row per record of B and the list of the records of A paired with it. `read_pairs` reads either as `id1` and `id2`, and `columns` names the two id columns when they are not `id1` and `id2`, as in `read_pairs('out.csv', columns=('a_id', 'b_id'))`.
+- *Candidate pairs.* A flat set with one column of table A's ids and one of table B's, or the grouped form with one row per record of B and the list of the records of A paired with it. `read_pairs` reads either as `id1` and `id2`. It recognises the id columns `a_id`/`b_id`, `ltable_id`/`rtable_id` and `left_id`/`right_id`, and `columns` names the two id columns when they have other names, as in `read_pairs('out.csv', columns=('product_a', 'product_b'))`. Ids are integers that are not negative. The section [Tables keyed by strings](technical-guide.md#tables-keyed-by-strings) of the technical guide describes how to give a table keyed by strings integer ids.
 - *Columns to compare.* The columns given to `create_features` must exist in both tables. A column whose values are numbers in at least 90% of the rows is detected as numeric and also gets a relative-difference feature.
-- *Labels, a gold set, or a labeler.* Labeled pairs have two id columns and `label`, with `label` 1.0 for a match and 0.0 for a non-match, and are read with `read_pairs(path, with_label=True)`. A gold set has two id columns and is read with `read_pairs`. Without either, labels are collected from a person or from code, as in Parts 3 to 5.
+- *Labels, a gold set, or a labeler.* Labeled pairs have two id columns and `label`, with `label` 1.0 for a match, 0.0 for a non-match and 2.0 for a pair labeled unsure, and are read with `read_pairs(path, with_label=True)`. A gold set has two id columns and is read with `read_pairs`. Without either, labels are collected from a person or from code, as in Parts 3 to 5.
 
-The files are Parquet, CSV or TSV files, or directories of Parquet files. The section [File formats](technical-guide.md#file-formats) of the technical guide describes them.
+The files are Parquet, CSV, TSV or JSON Lines files, or directories of Parquet files. The section [File formats](technical-guide.md#file-formats) of the technical guide describes them.
 
 ---
 

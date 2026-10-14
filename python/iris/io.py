@@ -13,19 +13,63 @@ log = logging.getLogger(__name__)
 _INTEGRAL_TYPES = {'tinyint', 'smallint', 'int', 'bigint'}
 
 
+PARQUET_MAGIC = b'PAR1'
+PAIR_COLUMNS = (('id1', 'id2'), ('a_id', 'b_id'), ('ltable_id', 'rtable_id'),
+                ('left_id', 'right_id'))
+PAIR_ID_NAMES = tuple(n for pair in PAIR_COLUMNS for n in pair)
+
+
+ONE_TABLE_MESSAGE = ('featurize: one table is matched against itself: {n_self:,} pair(s) of a '
+                     'record with itself and {repeats:,} repeated or mirrored pair(s) are '
+                     'dropped, and each pair is featurized once, as (smaller id, larger id)')
+
+
 def file_format(path):
-    """Return `'parquet'`, `'csv'` or `'tsv'` for a file, by its extension; a directory or
-    a URI without one is read as Parquet."""
+    """Return `'parquet'`, `'csv'`, `'tsv'` or `'jsonl'` for a file, by its name checked
+    against its contents; a directory or a remote URI is Parquet."""
     name = os.fspath(path).rstrip('/')
     low = name.lower()
+    s = files.scheme(name)
+    local = files.local_path(name) if s in (None, 'file') else None
     if low.endswith('.csv'):
-        return 'csv'
-    if low.endswith('.tsv'):
-        return 'tsv'
-    if low.endswith('.parquet') or files.scheme(name) or os.path.isdir(name):
+        fmt = 'csv'
+    elif low.endswith('.tsv'):
+        fmt = 'tsv'
+    elif low.endswith('.jsonl'):
+        fmt = 'jsonl'
+    elif low.endswith('.parquet') or local is None or os.path.isdir(local):
+        fmt = 'parquet'
+    else:
+        fmt = None
+    if local is None or not os.path.isfile(local):
+        if fmt is None:
+            raise ValueError(f'{name}: tables and pairs are read from a .parquet, .csv, .tsv '
+                             f'or .jsonl file, or a directory of Parquet files')
+        return fmt
+    with open(local, 'rb') as fh:
+        head = fh.read(len(PARQUET_MAGIC))
+    if head == PARQUET_MAGIC:
+        if fmt in ('csv', 'tsv', 'jsonl'):
+            raise ValueError(f'{name}: is named .{fmt} but holds Parquet data; rename it to '
+                             f'end in .parquet')
         return 'parquet'
-    raise ValueError(f'{name}: tables and pairs are read from a .parquet, .csv or .tsv file, '
-                     f'or a directory of Parquet files')
+    if fmt == 'parquet':
+        raise ValueError(f'{name}: is named .parquet but does not hold Parquet data; if it is '
+                         f'CSV or TSV text, rename it to end in .csv or .tsv')
+    if fmt is None:
+        raise ValueError(f'{name}: tables and pairs are read from a .parquet, .csv, .tsv or '
+                         f'.jsonl file, or a directory of Parquet files')
+    return fmt
+
+
+def parquet_name(path, what):
+    """Return `path` as a string, refusing a name that ends in the extension of a format
+    other than Parquet."""
+    name = os.fspath(path)
+    ext = os.path.splitext(name.rstrip('/'))[1].lower()
+    if ext not in ('', '.parquet'):
+        raise ValueError(f'{name}: {what} writes Parquet; name it so that it ends in .parquet')
+    return name
 
 
 def table_columns(path, names, id_col, columns):
@@ -46,21 +90,25 @@ def table_columns(path, names, id_col, columns):
 def pair_layout(path, names, is_list, columns, with_label):
     """Return how a file holds its pairs: flat, or grouped with one of the two id columns
     a list, as `(grouped, list_or_a, other_or_b, list_is_a)`."""
-    a, b = columns
     if with_label and 'label' not in names:
         raise ValueError(f"{path}: no column 'label' to read with with_label=True; "
                          f'columns: {names}')
-    if a in names and b in names:
-        if is_list(a) and not is_list(b):
-            return True, a, b, True
-        if is_list(b) and not is_list(a):
-            return True, b, a, False
-        return False, a, b, None
-    if tuple(columns) == ('id1', 'id2') and 'id2' in names and 'id1_list' in names:
+    default = tuple(columns) == PAIR_COLUMNS[0]
+    if default and 'id2' in names and 'id1_list' in names and 'id1' not in names:
         return True, 'id1_list', 'id2', True
-    raise ValueError(f"{path}: has neither the columns {list(columns)} nor the grouped "
-                     f"columns 'id2' and 'id1_list'; columns: {names}. Name the file's two id "
-                     f"columns with columns=(...)")
+    for a, b in (PAIR_COLUMNS if default else (tuple(columns),)):
+        if a in names and b in names:
+            if is_list(a) and not is_list(b):
+                return True, a, b, True
+            if is_list(b) and not is_list(a):
+                return True, b, a, False
+            return False, a, b, None
+    if default:
+        raise ValueError(f"{path}: has none of the pair columns id1/id2, a_id/b_id, "
+                         f"ltable_id/rtable_id or left_id/right_id, nor the grouped columns "
+                         f"'id2' and 'id1_list'; columns: {names}. Name the file's two id "
+                         f"columns with columns=(...)")
+    raise ValueError(f'{path}: has no columns {list(columns)}; columns: {names}')
 
 
 def read_parquet(spark, path):
@@ -143,8 +191,9 @@ def _warn_self_pairs(what, n, grouped):
     where = ("row(s) contain a self-pair (id2 in its own id1_list)" if grouped
              else 'self-pair(s) (id1 == id2)')
     log.warning(
-        f'{what}: {n} {where}. Self-pairs featurize as maximum-similarity and '
-        f'poison seeding; clean_candidates(..., drop_self_pairs=True) removes them.')
+        f'{what}: {n} {where}. featurize drops them when one table is matched against '
+        f'itself, and clean_candidates(..., drop_self_pairs=True) removes them from the '
+        f'candidate set.')
 
 
 def _warn_duplicate_ids(what, n):

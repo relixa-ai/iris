@@ -114,9 +114,9 @@ It does not use `sudo`, does not ask for your password, and does not modify anyt
 [4/6] creating .venv
       OK: .venv/ created with Python 3.12
 [5/6] installing iris and its dependencies with pip, from PyPI (a few minutes)
-      OK: iris 0.1.0 installed
+      OK: iris 0.2.0 installed
 [6/6] smoke test
-iris 0.1.0
+iris 0.2.0
 python    3.12.14
 engine    local, up to 18 worker processes
 features  13

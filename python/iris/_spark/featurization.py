@@ -134,7 +134,7 @@ def featurize(
     if isinstance(candidates, pd.DataFrame):
         candidates = as_spark(candidates, spark)
     if validate:
-        _warn_duplicate_pairs(candidates)
+        _warn_duplicate_pairs(candidates, one_table=B is None)
     if return_pandas:
         n_pairs = (candidates.count() if is_flat_candidates(candidates)
                    else candidates.select(
@@ -146,7 +146,7 @@ def featurize(
         )
     built = _build_records(A, B, features, tz)
     release = [built[0], built[2]]
-    fvs = _pair_pass(candidates, built, features, fill_na, output_col)
+    fvs = _pair_pass(candidates, built, features, fill_na, output_col, one_table=B is None)
     if out is not None or return_pandas:
         try:
             if out is not None:
@@ -215,9 +215,10 @@ def _build_records(A, B, features, tz):
             B.unpersist()
 
 
-def _pair_pass(candidates, built, features, fill_na=0.0, output_col='feature_vectors'):
+def _pair_pass(candidates, built, features, fill_na=0.0, output_col='feature_vectors',
+               one_table=False):
     recs_a, layout_a, recs_b, layout_b = built
-    return pairpass.pair_pass(canonical_pairs(candidates), recs_a, recs_b,
+    return pairpass.pair_pass(canonical_pairs(candidates, one_table), recs_a, recs_b,
                                     layout_a, layout_b, features, fill_na)\
                          .withColumnRenamed('fv', output_col)
 
@@ -243,17 +244,33 @@ def is_flat_candidates(pairs):
     return 'id1' in names and 'id1_list' not in names
 
 
-def canonical_pairs(candidates):
-    """Return a candidate set, flat or grouped, as distinct flat `(id1, id2)` pairs."""
+def canonical_pairs(candidates, one_table=False):
+    """Return a candidate set, flat or grouped, as flat `(id1, id2)` pairs; for one table,
+    without self-pairs and with `id1` the smaller id."""
     if is_flat_candidates(candidates):
-        return candidates.select(F.col('id1').cast('long').alias('id1'),
-                                 F.col('id2').cast('long').alias('id2'))
-    return candidates.select(F.explode('id1_list').alias('id1'), 'id2') \
-                     .select(F.col('id1').cast('long').alias('id1'),
-                             F.col('id2').cast('long').alias('id2'))
+        pairs = candidates.select(F.col('id1').cast('long').alias('id1'),
+                                  F.col('id2').cast('long').alias('id2'))
+    else:
+        pairs = candidates.select(F.explode('id1_list').alias('id1'), 'id2') \
+                          .select(F.col('id1').cast('long').alias('id1'),
+                                  F.col('id2').cast('long').alias('id2'))
+    if not one_table:
+        return pairs
+    return pairs.filter(F.col('id1') != F.col('id2')).select(
+        F.least('id1', 'id2').alias('id1'), F.greatest('id1', 'id2').alias('id2'))
 
 
-def _warn_duplicate_pairs(candidates):
+def _warn_duplicate_pairs(candidates, one_table=False):
+    if one_table:
+        from ..io import ONE_TABLE_MESSAGE
+        n = canonical_pairs(candidates).count()
+        pairs = canonical_pairs(candidates, one_table=True)
+        row = pairs.agg(F.count(F.lit(1)).alias('k'),
+                        F.count_distinct('id1', 'id2').alias('d')).head()
+        n_self, repeats = n - int(row['k']), int(row['k']) - int(row['d'])
+        if n_self or repeats:
+            log.warning(ONE_TABLE_MESSAGE.format(n_self=n_self, repeats=repeats))
+        return
     row = canonical_pairs(candidates).agg(
         F.count(F.lit(1)).alias('n'), F.count_distinct('id1', 'id2').alias('d')).head()
     n, d = int(row['n']), int(row['d'])

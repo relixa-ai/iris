@@ -56,6 +56,5 @@ print(f"precision {metrics['precision']:.4f}  recall {metrics['recall']:.4f}  "
 
 iris.save_features(features, f'{OUT}/features.pkl')
 # -> None
-iris.save_data(predictions[['id1', 'id2', 'prediction', 'confidence']],
-               f'{OUT}/predictions.parquet')
-# -> None
+iris.save_predictions(predictions, f'{OUT}/matches.parquet')
+# -> int                       the predicted matches written, as id1, id2 and probability

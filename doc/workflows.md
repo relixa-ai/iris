@@ -16,7 +16,7 @@ A matching run starts in one of four ways, depending on the data you already hav
 *What happens.* The labeled pairs are converted into feature vectors and the matcher is trained on them directly. No labeler, pool or active learning is involved.
 
 ```python
-labeled_pairs = iris.read_pairs('labels.csv', columns=('a_id', 'b_id'), with_label=True)
+labeled_pairs = iris.read_pairs('labels.csv', with_label=True)
 features = iris.create_features(table_a, table_b, columns, columns)
 labeled  = iris.featurize(features, table_a, table_b, labeled_pairs[['id1', 'id2']])
 labeled  = labeled.merge(labeled_pairs[['id1', 'id2', 'label']], on=['id1', 'id2'])
@@ -86,8 +86,8 @@ labeler = TitleAndYear(table_a, table_b, iris.CLILabeler(table_a, table_b))
 
 ### After any of the four
 
-- To find the duplicates within one table, pass the same table object as A and as B, as in `featurize(features, table, table, candidates)`. Clean the candidate set with `clean_candidates(candidates, drop_self_pairs=True, canonicalize_mirrors=True)`, create the gold labeler with `symmetric=True`, and evaluate with `dedup=True`. `examples/run_dedup.py` shows this on a table of 1,000,000 songs.
+- To find the duplicates within one table, pass the same table object as A and as B, as in `featurize(features, table, table, candidates)`. `featurize` then drops the pairs of a record with itself and featurizes each pair once, as (smaller id, larger id). Create the gold labeler with `symmetric=True`, and evaluate with `dedup=True`. To clean the candidate set itself, use `clean_candidates(candidates, drop_self_pairs=True, canonicalize_mirrors=True)`. `examples/run_dedup.py` shows this on a table of 1,000,000 songs.
 - When the candidate set has at most 10,000,000 pairs, active learning can run over all of it rather than a pool. Skip `down_sample`, and pass the feature vectors to `create_seeds` and `label_al` as the pool. Active learning scores every pair of the pool in each round, so a larger pool makes each round slower, and `label_al` refuses a pool of more than 10,000,000 pairs.
 - When the candidate set is larger than the memory of the machine, read the tables and the candidate set with `read_table` and `read_pairs` and `df_type='arrow'`, and pass `out` to `featurize` so that the feature vectors are written to disk. `examples/run_dedup.py` does both.
 - To run any workflow on Spark, give the functions Spark DataFrames. `examples/run_spark.py` runs workflow 3 on Spark running on this machine only, and `examples/run_spark_cluster.py` runs it on a cluster.
-- `save_features` and `save_data` save the features and the predictions. A saved set of features can be loaded with `load_features` to featurize new pairs with the same features in the same order, which a matcher trained on them requires.
+- `save_features` saves the features, and `save_predictions` writes the predicted matches, with their probability of a match. A saved set of features can be loaded with `load_features` to featurize new pairs with the same features in the same order, which a matcher trained on them requires.

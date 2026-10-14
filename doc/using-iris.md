@@ -4,7 +4,7 @@ Iris provides the matching process as a set of Python functions. The functions f
 
 | Need to do | Functions |
 | --- | --- |
-| Read, write and check the data | `read_table`, `read_pairs`, `load_data`, `save_data`, `check_tables`, `check_candidates`, `check_gold_data`, `check_labeled_data`, `check_pairs`, `clean_candidates` |
+| Read, write and check the data | `read_table`, `read_pairs`, `load_data`, `save_data`, `save_predictions`, `check_tables`, `check_candidates`, `check_gold_data`, `check_labeled_data`, `check_pairs`, `clean_candidates` |
 | Convert the output of a blocker | `candidates_from_flat`, `candidates_from_result`, `write_flat_candidates` |
 | Featurize pairs | `create_features`, `featurize`, `get_base_sim_functions`, `get_base_tokenizers`, `get_extra_tokenizers`, `save_features`, `load_features` |
 | Label pairs | `label_pairs`, `down_sample`, `create_seeds`, `label_al`, `GoldLabeler`, `DelayedGoldLabeler`, `CLILabeler`, `WebUILabeler`, `CustomLabeler` |

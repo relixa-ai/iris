@@ -16,6 +16,9 @@ from .procpool import atomic_output, run_tasks, workers_for
 
 WORKER_GB = 1.0
 
+MATCH_SCHEMA = pa.schema([pa.field('id1', pa.int64()), pa.field('id2', pa.int64()),
+                          pa.field('probability', pa.float32())])
+
 PREDICT_ROWS = 1 << 18
 
 
@@ -70,6 +73,35 @@ def _gold_ids(gold):
         return gold['id1'].to_numpy(), gold['id2'].to_numpy()
     table = gold if isinstance(gold, pa.Table) else gold.to_table(columns=['id1', 'id2'])
     return table.column('id1').to_numpy(), table.column('id2').to_numpy()
+
+
+def save_matches(predictions, path, threshold):
+    """Write the predicted matches at `threshold` to one Parquet file as `id1`, `id2` and
+    `probability`, and return their number."""
+    partial = f'{path}.partial-{os.getpid()}'
+    written = 0
+    writer = pq.ParquetWriter(partial, MATCH_SCHEMA, compression='zstd')
+    try:
+        for batch in inputs.arrow_batches(predictions, ['id1', 'id2', 'prediction', 'confidence']):
+            pred = batch.column('prediction').to_numpy(zero_copy_only=False)
+            conf = batch.column('confidence').to_numpy(zero_copy_only=False)
+            keep = np.flatnonzero(metrics.positives(pred, conf, threshold))
+            if not len(keep):
+                continue
+            prob = metrics.p_match(pred[keep], conf[keep]).astype(np.float32)
+            writer.write_batch(pa.RecordBatch.from_arrays(
+                [pa.array(batch.column('id1').to_numpy(zero_copy_only=False)[keep], pa.int64()),
+                 pa.array(batch.column('id2').to_numpy(zero_copy_only=False)[keep], pa.int64()),
+                 pa.array(prob, pa.float32())], schema=MATCH_SCHEMA))
+            written += len(keep)
+        writer.close()
+        os.replace(partial, path)
+    except BaseException:
+        writer.close()
+        if os.path.exists(partial):
+            os.remove(partial)
+        raise
+    return written
 
 
 def evaluate_counts(predictions, gold, threshold, dedup):

@@ -45,8 +45,13 @@ def table(df, name):
     if dtype is not None:
         raise ValueError(
             f"{name} '_id' must be an integer column (ids are int64 "
-            f"join keys), got {dtype}")
+            f"join keys), got {dtype}; a table keyed by strings is given integer ids as 'Tables keyed by strings' in the technical guide describes")
     ids = pd.Series(np.concatenate(parts))
+    negative = ids[ids < 0]
+    if len(negative):
+        raise ValueError(
+            f"{name} '_id' must be non-negative; {len(negative)} negative id(s), e.g. ids "
+            f"{negative.head(5).tolist()}")
     n_distinct = int(ids.nunique())
     if n_distinct < n:
         dups = ids[ids.duplicated()].drop_duplicates().head(5).tolist()

@@ -275,6 +275,7 @@ class ContinuousLearner:
         labeled_queue = Queue(self._queue_size * 5)
 
         stop_training = Event()
+        pool_queued = Event()
 
         existing_training_data = load_training_data_streaming(self._checkpoint_path, log)
         check_training_data_matches(
@@ -300,7 +301,7 @@ class ContinuousLearner:
 
         training_thread = Thread(
             target=self._training_loop,
-            args=(to_be_label_queue, labeled_queue, stop_training, pool, seeds),
+            args=(to_be_label_queue, labeled_queue, stop_training, pool_queued, pool, seeds),
             daemon=True,
         )
         training_thread.start()
@@ -310,6 +311,8 @@ class ContinuousLearner:
         if isinstance(self._labeler, WebUILabeler):
             log.warning("Records are almost ready to be labeled.")
         while (not terminate and self._on_demand_stop) or (nlabeled < self._max_labeled and not self._on_demand_stop):
+            if pool_queued.is_set() and to_be_label_queue.empty():
+                break
             try:
                 example = to_be_label_queue.get(timeout=10).item
             except Empty:
@@ -353,7 +356,20 @@ class ContinuousLearner:
             log.warning("Active learning is complete.")
         return labeled_data
 
-    def _training_loop(self, to_be_label_queue, labeled_queue, stop_event, pool, seeds):
+    def _take_labels(self, labeled_queue, iteration):
+        new_examples = []
+        while not labeled_queue.empty():
+            new_examples.append(labeled_queue.get())
+        if len(new_examples) != 0:
+            df = pd.DataFrame(new_examples)
+
+            df['labeled_in_iteration'] = float(iteration)
+            self.local_training_fvs_.loc[df.index, 'label'] = df['label']
+            self.local_training_fvs_.loc[df.index, 'labeled_in_iteration'] = df['labeled_in_iteration']
+
+            save_training_data_streaming(df, self._checkpoint_path, log)
+
+    def _training_loop(self, to_be_label_queue, labeled_queue, stop_event, pool_queued, pool, seeds):
         try:
             try:
                 n_fvs = pool.count()
@@ -373,9 +389,8 @@ class ContinuousLearner:
                 if total_pos == 0 or total_neg == 0:
                     raise RuntimeError('both positive and negative vectors are required for training')
 
-                i = -1
+                i = 0
                 while not stop_event.is_set():
-                    i += 1
                     while (self._queue_size - to_be_label_queue.qsize() < self._min_batch_size
                            and not stop_event.is_set()):
                         time.sleep(1)
@@ -383,17 +398,7 @@ class ContinuousLearner:
                     if stop_event.is_set():
                         break
 
-                    new_examples = []
-                    while not labeled_queue.empty():
-                        new_examples.append(labeled_queue.get())
-                    if len(new_examples) != 0:
-                        df = pd.DataFrame(new_examples)
-
-                        df['labeled_in_iteration'] = float(i)
-                        self.local_training_fvs_.loc[df.index, 'label'] = df['label']
-                        self.local_training_fvs_.loc[df.index, 'labeled_in_iteration'] = df['labeled_in_iteration']
-
-                        save_training_data_streaming(df, self._checkpoint_path, log)
+                    self._take_labels(labeled_queue, i)
 
                     labeled_only = self.local_training_fvs_.dropna(subset=['label'])
                     pool.train(self._model, labeled_only)
@@ -411,10 +416,14 @@ class ContinuousLearner:
                         ent = r.pop('entropy')
                         to_be_label_queue.put(PQueueItem(ent, r))
 
+                    i += 1
                     if n_fvs <= len(self.local_training_fvs_):
-                        log.info('all fvs labeled, terminating active learning')
-                        break
+                        log.info('every pair in the pool is queued: active learning ends '
+                                 'when they are labeled')
+                        pool_queued.set()
+                        stop_event.wait()
 
+                self._take_labels(labeled_queue, i)
                 self.local_training_fvs_ = self.local_training_fvs_.dropna(subset=['label'])
                 pool.train(self._model, self.local_training_fvs_)
             finally:

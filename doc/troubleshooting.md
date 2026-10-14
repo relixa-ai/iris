@@ -11,9 +11,12 @@ These are raised by `read_table` and `read_pairs`.
 | `<path>: no column '<id_col>' to use as the id; columns: [...]` | The table's id column has another name. | Pass its name, as in `read_table(path, id_col='product_id')`. |
 | `<path>: no column(s) [...]; columns: [...]` | `columns` names attribute columns the table does not have. | Use the names listed. |
 | `<path>: has both '_id' and the id column '<id_col>'; read it with id_col='_id', or drop one of them` | The file has a column `_id` in addition to the id column named by `id_col`. | Read it with `id_col='_id'`, or remove one of the two columns. |
-| `<path>: has neither the columns ['id1', 'id2'] nor the grouped columns 'id2' and 'id1_list'; columns: [...]. Name the file's two id columns with columns=(...)` | The pairs' id columns have other names. | Pass them, table A's first, as in `read_pairs(path, columns=('a_id', 'b_id'))`. |
+| `<path>: has none of the pair columns id1/id2, a_id/b_id, ltable_id/rtable_id or left_id/right_id, nor the grouped columns 'id2' and 'id1_list'; columns: [...]. Name the file's two id columns with columns=(...)` | The pairs' id columns have names that are not recognised. | Pass them, table A's first, as in `read_pairs(path, columns=('product_a', 'product_b'))`. |
+| `<path>: has no columns [...]; columns: [...]` | The columns given with `columns` are not in the file. | Use the names listed. |
+| `<path>: is named .parquet but does not hold Parquet data; if it is CSV or TSV text, rename it to end in .csv or .tsv` | The file holds another format than its name says, often CSV written by a blocker under a `.parquet` name. | Rename the file as the message says. |
+| `<path>: is named .csv but holds Parquet data; rename it to end in .parquet` | The file holds Parquet data under a `.csv` or `.tsv` name. | Rename it to end in `.parquet`. |
 | `<path>: no column 'label' to read with with_label=True; columns: [...]` | The file has no label column. | Leave out `with_label`, or name the labels `label`. |
-| `<path>: tables and pairs are read from a .parquet, .csv or .tsv file, or a directory of Parquet files` | The file has another extension. | Convert it to one of these formats. |
+| `<path>: tables and pairs are read from a .parquet, .csv, .tsv or .jsonl file, or a directory of Parquet files` | The file has another extension. | Convert it to one of these formats. |
 | `<path>: the file has no header row` | A CSV or TSV file whose first line does not name the columns. | Add a first line with the column names. |
 | `df_type is 'pandas', 'arrow' or 'sparkdf', got '<value>'` | An unknown kind of result was asked for. | Use one of the three. |
 
@@ -25,7 +28,8 @@ These are raised by the `check_*` functions, and by `featurize` before any work.
 |---|---|---|
 | `<table> must have an '_id' column; got [...]` | The table's id column is not named `_id`. | Read the table with `read_table(path, id_col=...)`, which renames it. |
 | `<table> '_id' has <n> null value(s); every record needs an id` | Some rows have no id. | Fill them in. Every record needs a distinct integer id. |
-| `<table> '_id' must be an integer column (ids are int64 join keys), got <type>` | The ids are text or floating-point numbers. | Convert the ids to integers, and the ids of the candidate set and the gold set with them. |
+| `<table> '_id' must be an integer column (ids are int64 join keys), got <type>; a table keyed by strings is given integer ids as 'Tables keyed by strings' in the technical guide describes` | The ids are text or floating-point numbers. | Give the table integer ids as [Tables keyed by strings](technical-guide.md#tables-keyed-by-strings) describes, and the candidate set and the gold set the same ids. |
+| `<table> '_id' must be non-negative; <n> negative id(s), e.g. ids [...]` | Some ids are below zero. | Renumber the ids from zero, and the ids of the candidate set and the gold set with them. |
 | `<table> '_id' must be unique; <n> duplicate row(s), e.g. ids [...]` | Two rows share an id. | Give every record a distinct id. |
 | `<table> is empty` | The table has no rows. | Check the path and the filter that produced the table. |
 | `candidates must be flat (columns 'id1', 'id2' -- one row per pair) or grouped (columns 'id2', 'id1_list' -- one row per B record); got [...]` | The candidate set has neither accepted shape. | Read the blocker's output with `read_pairs(path, columns=(...))`, which names its id columns `id1` and `id2`. |
@@ -33,7 +37,7 @@ These are raised by the `check_*` functions, and by `featurize` before any work.
 | `candidates contain null ids (<n> in id1, <n> in id2)` | Some pairs lack an id. | Drop those rows. |
 | `candidates 'id1' references id(s) not present in table_a's '_id' column, e.g. [...]. Every pair must point at records that exist.` | The candidate set names records that the table does not have, usually because the table was filtered or the candidate set belongs to other tables. | Use the tables the blocker ran on. |
 | `candidates 'id2' must be unique (one row per B record); <n> duplicate row(s)` | A grouped candidate set lists a record of B on more than one row. | Merge those rows, or convert the candidate set to the flat form. |
-| `candidates: <n> self-pair(s) (id1 == id2). Self-pairs featurize as maximum-similarity and poison seeding; clean_candidates(..., drop_self_pairs=True) removes them.` | A warning in a deduplication. A record is paired with itself. | Clean the candidate set as the message says. |
+| `candidates: <n> self-pair(s) (id1 == id2). featurize drops them when one table is matched against itself, and clean_candidates(..., drop_self_pairs=True) removes them from the candidate set.` | A warning in a deduplication. A record is paired with itself. | Nothing for `featurize`. To remove them from the candidate set itself, use `clean_candidates` as the message says. |
 | `candidates: <n> row(s) contain duplicate ids within 'id1_list'; duplicates can be labeled twice and leak between training and application sets. clean_candidates removes them.` | A warning. A grouped row lists the same record twice. | Clean the candidate set with `clean_candidates`. |
 | `labeled_data must have the column '<label>'; got [...]` | The labeled pairs have no label column of that name. | Name the column `label`, or pass its name. |
 | `<input> is an Arrow dataset and other inputs are Spark DataFrames: pass all inputs local or all as Spark` | Some inputs of one call are Arrow datasets and others are Spark DataFrames. | Read every input of the run with the same `df_type`. |
@@ -49,6 +53,7 @@ These are raised by the `check_*` functions, and by `featurize` before any work.
 | `numeric_threshold is a rate in [0, 1] or None, got <value>` | `numeric_threshold` was given as a percentage or as text. | Pass a fraction such as 0.9, or None to detect numeric columns by type only. |
 | `unknown timezone '<name>': use an IANA zone name such as "UTC" or "Europe/Paris"` | The `timezone` argument names no time zone. | Use a name from the IANA time-zone database. |
 | `featurize: <n> of <n> candidate pairs are repeats and are dropped; each distinct pair is featurized once` | A warning. The candidate set lists some pairs more than once. | Nothing. To remove the repeats from the candidate set itself, use `clean_candidates`. |
+| `featurize: one table is matched against itself: <n> pair(s) of a record with itself and <n> repeated or mirrored pair(s) are dropped, and each pair is featurized once, as (smaller id, larger id)` | A warning in a deduplication. The candidate set holds pairs of a record with itself, or the same pair in both orders. | Nothing. To clean the candidate set itself, use `clean_candidates(candidates, drop_self_pairs=True, canonicalize_mirrors=True)`. |
 
 ### Disk, memory and workers on one machine
 
@@ -82,6 +87,8 @@ These are raised by the `check_*` functions, and by `featurize` before any work.
 |---|---|---|
 | `training needs matches and non-matches, but the labels hold <n> match(es) and <n> non-match(es)` | The labeled pairs hold only one class once the unsure ones are left out. | Label more pairs, including at least one of each class. |
 | `<label> holds [...]; a label is 1.0 (match), 0.0 (non-match) or 2.0 (unsure)` | The label column holds other values, such as `-1` or text. | Convert the labels to 1.0, 0.0 and 2.0. |
+| `<path>: <function> writes Parquet; name it so that it ends in .parquet` | `save_data`, `save_predictions` or `write_flat_candidates` was given a path whose name ends in another extension, such as `.csv`. | Name the file so that it ends in `.parquet`. |
+| `save_predictions needs the columns [...]; pass the result of apply_matcher(..., 'prediction', 'confidence')` | The predictions have no `confidence` column, or lack the ids. | Call `apply_matcher` with a `confidence_col`. |
 | `Model must be trained to predict` | `apply_matcher` was given a model that has not been trained. | Pass the model that `train_matcher` returned. |
 | `SparkMLModel predicts on Spark: pass the feature vectors as a Spark DataFrame, or use an SKLearnModel on local data` | A Spark ML classifier was given pandas or Arrow data, which run on the local engine. | Use `SKLearnModel` on the local engine, or run the whole workflow on Spark. |
 

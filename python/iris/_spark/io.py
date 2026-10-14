@@ -32,16 +32,22 @@ def validate_table(df, name):
     if dtype not in _INTEGRAL_TYPES:
         raise ValueError(
             f"{name} '_id' must be an integer column (ids are int64 "
-            f"join keys), got {dtype}")
+            f"join keys), got {dtype}; a table keyed by strings is given integer ids as 'Tables keyed by strings' in the technical guide describes")
     r = df.agg(F.count(F.lit(1)).alias('n'),
                F.count('_id').alias('n_nonnull'),
-               F.count_distinct('_id').alias('n_distinct')).head()
+               F.count_distinct('_id').alias('n_distinct'),
+               F.sum(F.when(F.col('_id') < 0, 1).otherwise(0)).alias('n_negative')).head()
     if r['n'] == 0:
         raise ValueError(f'{name} is empty')
     if r['n_nonnull'] < r['n']:
         raise ValueError(
             f"{name} '_id' has {r['n'] - r['n_nonnull']} null value(s); every "
             f"record needs an id")
+    if r['n_negative']:
+        neg = [row['_id'] for row in df.filter(F.col('_id') < 0).select('_id').limit(5).collect()]
+        raise ValueError(
+            f"{name} '_id' must be non-negative; {r['n_negative']} negative id(s), e.g. ids "
+            f"{neg}")
     if r['n_distinct'] < r['n_nonnull']:
         dups = (df.groupBy('_id').count().filter(F.col('count') > 1)
                   .limit(5).collect())

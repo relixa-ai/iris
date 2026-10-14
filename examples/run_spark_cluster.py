@@ -41,8 +41,8 @@ labeled = iris.label_al(model, 'batch', labeler, pool, seeds,
 matcher = iris.train_matcher(model, labeled)
 predictions = iris.apply_matcher(matcher, fvs, 'feature_vectors', 'prediction', 'confidence')
 # -> pyspark.sql.DataFrame     the rows of fvs with prediction and confidence
-(predictions.select('id1', 'id2', 'prediction', 'confidence')
- .write.mode('overwrite').parquet(f'{out}/predictions.parquet'))
+iris.save_predictions(predictions, f'{out}/matches.parquet')
+# -> int                       the predicted matches written, as id1, id2 and probability
 metrics = iris.evaluate(predictions, gold)
 print(f"precision {metrics['precision']:.4f}  recall {metrics['recall']:.4f}  "
       f"f1 {metrics['f1']:.4f}")

@@ -1,42 +1,49 @@
 """Conversions between the flat and the grouped forms of a candidate set."""
 from __future__ import annotations
 
+import os
+
 import pandas as pd
+
+
+def _score_column(columns, score_col):
+    if score_col in columns:
+        return score_col
+    if score_col == "blocking_score" and "score" in columns:
+        return "score"
+    return None
 
 
 def candidates_from_flat(
     pairs: pd.DataFrame,
     a_col: str = "id1",
     b_col: str = "id2",
-    score_col: str = "score",
+    score_col: str = "blocking_score",
     sort_by_score: bool = True,
 ) -> pd.DataFrame:
-    """Return a flat pair table grouped into one row per record of table B, with the
-    lists `id1_list` and `scores`."""
-    required = {a_col, b_col, score_col}
-    missing = required - set(pairs.columns)
+    """Return a flat pair table grouped into one row per record of table B, with the list
+    `id1_list` and, when the pairs have a blocking score, the list `blocking_scores`."""
+    missing = {a_col, b_col} - set(pairs.columns)
     if missing:
         raise ValueError(
             f"candidates_from_flat: input is missing column(s) {sorted(missing)}; "
             f"got {list(pairs.columns)}")
+    score = _score_column(pairs.columns, score_col)
+    lists = ["id1_list"] + (["blocking_scores"] if score else [])
 
     if len(pairs) == 0:
-        return pd.DataFrame({"id2": [], "id1_list": [], "scores": []})
+        return pd.DataFrame({"id2": [], **{c: [] for c in lists}})
 
-    df = pairs[[b_col, a_col, score_col]]
-    if sort_by_score:
-        df = df.sort_values([b_col, score_col], ascending=[True, False], kind="stable")
+    df = pairs[[b_col, a_col] + ([score] if score else [])]
+    if sort_by_score and score:
+        df = df.sort_values([b_col, score], ascending=[True, False], kind="stable")
 
     grouped = df.groupby(b_col, sort=False)
     id1_list = grouped[a_col].apply(lambda s: [int(x) for x in s])
-    scores = grouped[score_col].apply(lambda s: [float(x) for x in s])
-
-    out = pd.DataFrame({
-        "id2": [int(x) for x in id1_list.index],
-        "id1_list": id1_list.to_numpy(),
-        "scores": scores.to_numpy(),
-    })
-    return out.reset_index(drop=True)
+    out = {"id2": [int(x) for x in id1_list.index], "id1_list": id1_list.to_numpy()}
+    if score:
+        out["blocking_scores"] = grouped[score].apply(lambda s: [float(x) for x in s]).to_numpy()
+    return pd.DataFrame(out).reset_index(drop=True)
 
 
 def candidates_from_result(result, sort_by_score: bool = True) -> pd.DataFrame:
@@ -56,7 +63,7 @@ def candidates_from_result(result, sort_by_score: bool = True) -> pd.DataFrame:
             bucket[1].append(float(s_list[i]))
 
     if not groups:
-        return pd.DataFrame({"id2": [], "id1_list": [], "scores": []})
+        return pd.DataFrame({"id2": [], "id1_list": [], "blocking_scores": []})
 
     id2, id1_list, scores = [], [], []
     for b_id, (a_list, s_list) in groups.items():
@@ -68,22 +75,26 @@ def candidates_from_result(result, sort_by_score: bool = True) -> pd.DataFrame:
         id1_list.append(a_list)
         scores.append(s_list)
 
-    return pd.DataFrame({"id2": id2, "id1_list": id1_list, "scores": scores})
+    return pd.DataFrame({"id2": id2, "id1_list": id1_list, "blocking_scores": scores})
 
 
 def write_flat_candidates(result, path, chunk_rows: int = 8_000_000) -> int:
-    """Write the pairs of a blocker result to a Parquet file as flat `(id1, id2, score)`
-    rows and return the number written."""
+    """Write the pairs of a blocker result to a Parquet file as flat `(id1, id2,
+    blocking_score)` rows and return the number written."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
+    from .io import parquet_name
+
+    name = parquet_name(path, "write_flat_candidates")
     schema = pa.schema([
         pa.field('id1', pa.int64()),
         pa.field('id2', pa.int64()),
-        pa.field('score', pa.float32()),
+        pa.field('blocking_score', pa.float32()),
     ])
+    partial = f"{name}.partial-{os.getpid()}"
     written = 0
-    writer = None
+    writer = pq.ParquetWriter(partial, schema, compression='zstd')
     try:
         for a_ids, b_ids, scores in result.iter_pairs(chunk_rows=chunk_rows):
             batch = pa.RecordBatch.from_arrays(
@@ -91,11 +102,13 @@ def write_flat_candidates(result, path, chunk_rows: int = 8_000_000) -> int:
                  pa.array(b_ids, type=pa.int64()),
                  pa.array(scores, type=pa.float32())],
                 schema=schema)
-            if writer is None:
-                writer = pq.ParquetWriter(str(path), schema, compression='zstd')
             writer.write_batch(batch)
             written += batch.num_rows
-    finally:
-        if writer is not None:
-            writer.close()
+        writer.close()
+        os.replace(partial, name)
+    except BaseException:
+        writer.close()
+        if os.path.exists(partial):
+            os.remove(partial)
+        raise
     return written

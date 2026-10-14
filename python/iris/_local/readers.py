@@ -1,5 +1,5 @@
-"""Reading tables and pairs from Parquet, CSV or TSV files into pandas or Arrow, with the
-column names of Iris."""
+"""Reading tables and pairs from Parquet, CSV, TSV or JSON Lines files into pandas or Arrow,
+with the column names of Iris."""
 import csv
 import os
 import tempfile
@@ -8,6 +8,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.csv as pcsv
 import pyarrow.dataset as ds
+import pyarrow.json as pjson
 import pyarrow.parquet as pq
 
 from . import inputs
@@ -17,9 +18,16 @@ ROW_GROUP_ROWS = 65_536
 
 def source(path, fmt, types):
     """Return a lazy dataset over a file, a text file with the given column types and
-    every other column read as text."""
+    every other column read as text, or as JSON gives it for JSON Lines."""
     if fmt == 'parquet':
         return inputs.dataset(path)
+    if fmt == 'jsonl':
+        found = _jsonl_schema(path)
+        schema = pa.schema([pa.field(f.name, types.get(f.name, f.type)) for f in found])
+        if os.path.getsize(path) == 0:
+            return ds.dataset(schema.empty_table())
+        return ds.dataset(path, schema=schema, format=ds.JsonFileFormat(
+            parse_options=pjson.ParseOptions(explicit_schema=schema)))
     delimiter = '\t' if fmt == 'tsv' else ','
     with open(path, newline='', encoding='utf-8') as fh:
         names = next(csv.reader(fh, delimiter=delimiter), None)
@@ -30,6 +38,19 @@ def source(path, fmt, types):
         parse_options=pcsv.ParseOptions(delimiter=delimiter),
         convert_options=pcsv.ConvertOptions(column_types=column_types,
                                             strings_can_be_null=True)))
+
+
+def _jsonl_schema(path, head_bytes=1 << 20):
+    with open(path, 'rb') as fh:
+        head = fh.read(head_bytes)
+        while head and not head.endswith(b'\n'):
+            more = fh.read(head_bytes)
+            if not more:
+                break
+            head += more
+    if not head.strip():
+        return pa.schema([('id1', pa.int64()), ('id2', pa.int64())])
+    return pjson.read_json(pa.BufferReader(head[:head.rfind(b'\n') + 1] or head)).schema
 
 
 def output(path, src, projection, df_type, as_is, transform=None):

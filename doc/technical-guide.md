@@ -24,21 +24,42 @@ The data of a run has the following shapes.
 
 | Data | Columns | Notes |
 | --- | --- | --- |
-| A table | `_id`, and the columns to compare | `_id` is an integer column of unique, non-null values. |
-| A flat candidate set | `id1`, `id2` | `id1` is an `_id` of table A, and `id2` an `_id` of table B. Other columns, such as a blocker's `score`, are ignored. |
-| A grouped candidate set | `id2`, `id1_list` | One row per record of B, with the list of the records of A paired with it. A list column of the same length, such as `scores`, is ignored. |
+| A table | `_id`, and the columns to compare | `_id` is an integer column of unique, non-null, non-negative values. |
+| A flat candidate set | `id1`, `id2` | `id1` is an `_id` of table A, and `id2` an `_id` of table B. A blocker's score, in `blocking_score` or in `score` as earlier blockers name it, and any other column are ignored. |
+| A grouped candidate set | `id2`, `id1_list` | One row per record of B, with the list of the records of A paired with it. A list column of the same length, such as `blocking_scores`, is ignored. |
 | Labeled pairs | `id1`, `id2`, `label` | `label` is 1.0 for a match, 0.0 for a non-match, and 2.0 for a pair labeled unsure. The grouped form has `label` as a list aligned with `id1_list`. |
 | A gold set | `id1`, `id2` | The pairs known to be matches. |
 | Feature vectors | `id1`, `id2`, `feature_vectors`, `score` | `feature_vectors` holds one float32 array per pair, with one value per feature, in the order of the list of features. |
 | Predictions | the columns of the feature vectors, `prediction`, `confidence` | `prediction` is 1.0 or 0.0, and `confidence` is the probability of the predicted class. |
+| Predicted matches | `id1`, `id2`, `probability` | The file that `save_predictions` writes, with only the pairs predicted to match and the probability of a match of each. |
 
 In a deduplication, table A and table B are the same table, passed as the same object. A file whose columns have other names is read with `read_table` and `read_pairs`, which give it these names.
+
+### Tables keyed by strings
+
+Iris needs integer ids. A table keyed by strings, such as product codes, is given an integer `_id` once, before blocking, and the gold set is mapped to the same ids. The blocker, Iris and the evaluation then use the same ids. In a deduplication, `table_b` is `table_a`.
+
+```python
+import pandas as pd
+
+table_a = pd.read_csv('table_a.csv')
+table_b = pd.read_csv('table_b.csv')
+gold = pd.read_csv('gold.csv')
+table_a.insert(0, '_id', range(len(table_a)))
+table_b.insert(0, '_id', range(len(table_b)))
+id_a = dict(zip(table_a['code'], table_a['_id']))
+id_b = dict(zip(table_b['code'], table_b['_id']))
+gold = pd.DataFrame({'id1': gold['code_a'].map(id_a), 'id2': gold['code_b'].map(id_b)})
+table_a.to_parquet('table_a.parquet', index=False)
+table_b.to_parquet('table_b.parquet', index=False)
+gold.to_parquet('gold.parquet', index=False)
+```
 
 ## Reading and writing files
 
 ### File formats
 
-`read_table` and `read_pairs` read the tables and the sets of pairs from Parquet files, directories of Parquet files, CSV files and TSV files, with any names for their id columns, and give them the column names of Iris. The feature vectors and the predictions are written as Parquet. A directory written by Spark or by a function of Iris holds a file `_SUCCESS` when it was written to completion. The directory of feature vectors written by `featurize` also holds a file `_iris.json`, which lists the features that made them.
+`read_table` and `read_pairs` read the tables and the sets of pairs from Parquet files, directories of Parquet files, CSV files, TSV files and JSON Lines files, with any names for their id columns, and give them the column names of Iris. A file is recognised as Parquet by its contents. A file named `.parquet` that holds CSV text, or a CSV or TSV file that holds Parquet data, is refused with a message, and a file without an extension is read when it holds Parquet data. The feature vectors and the predicted matches are written as Parquet, and a function that writes Parquet refuses a path whose name ends in another extension. A directory written by Spark or by a function of Iris holds a file `_SUCCESS` when it was written to completion. The directory of feature vectors written by `featurize` also holds a file `_iris.json`, which lists the features that made them.
 
 A Parquet file is read in *row groups*. The local engine reads a table a row group at a time, and a labeler that looks up a record reads the row group that holds it. Tables written with row groups of about 65,536 rows keep both the memory of each read and the time of each lookup small, as `pyarrow.parquet.write_table(table, path, row_group_size=65536)` does.
 
@@ -46,7 +67,7 @@ A Parquet file is read in *row groups*. The local engine reads a table a row gro
 
 ```python
 def read_table(
-    path,                            # a .parquet, .csv or .tsv file, or a directory of Parquet files
+    path,                            # a .parquet, .csv, .tsv or .jsonl file, or a directory of Parquet files
     id_col: str = '_id',             # the integer id column of the file
     columns: List[str] = None,       # the attribute columns to read; all by default
     df_type: str = 'pandas',         # 'pandas', 'arrow' or 'sparkdf'
@@ -64,14 +85,14 @@ Reads a table of records, with its id column named `_id`. Runs on either engine.
 
 This function:
 
-1. Reads a Parquet file with the types it has. Reads a CSV or TSV file, whose first line names the columns, with the id as a 64-bit integer and every other column as text, an empty cell being a missing value.
+1. Reads a Parquet file with the types it has. Reads a CSV or TSV file, whose first line names the columns, with the id as a 64-bit integer and every other column as text, an empty cell being a missing value. Reads a JSON Lines file, one JSON object per line, with the id as a 64-bit integer and every other key as JSON gives it.
 2. Checks that the id column exists, and that the file has no other column named `_id`.
 3. Renames the id column to `_id` and keeps the columns asked for.
 4. For `'arrow'`, opens a Parquet file that needs no renaming as it is, without reading it. Any other file is written once as Parquet to the scratch directory, a batch at a time, and opened from there.
 
 **Returns:** a `pandas.DataFrame`, a `pyarrow.dataset.Dataset` or a `pyspark.sql.DataFrame` with the column `_id` and the attribute columns.
 
-**Raises:** `ValueError` when the id column or a column of `columns` is missing, when the file has both `_id` and another id column, when the extension is not one of the three, or when `df_type` is unknown.
+**Raises:** `ValueError` when the id column or a column of `columns` is missing, when the file has both `_id` and another id column, when the extension is not one of the four or does not match the contents of the file, or when `df_type` is unknown.
 
 **Example:**
 
@@ -83,7 +104,7 @@ table_a = iris.read_table('data/abt_buy/table_a.csv', id_col='product_id', df_ty
 
 ```python
 def read_pairs(
-    path,                            # a .parquet, .csv or .tsv file, or a directory of Parquet files
+    path,                            # a .parquet, .csv, .tsv or .jsonl file, or a directory of Parquet files
     columns=('id1', 'id2'),          # the file's id columns of table A and of table B
     with_label: bool = False,        # also read the column label
     df_type: str = 'pandas',         # 'pandas', 'arrow' or 'sparkdf'
@@ -94,25 +115,26 @@ Reads a set of pairs, which can be a candidate set, a gold set or labeled pairs,
 
 **Parameters:**
 
-- `columns`: the names of the two id columns in the file, the column of table A's ids first. A blocker that names them `a_id` and `b_id` is read with `columns=('a_id', 'b_id')`.
+- `columns`: the names of the two id columns in the file, the column of table A's ids first. With the default, a file that has no columns `id1` and `id2` is read from the first of the pairs `a_id`/`b_id`, `ltable_id`/`rtable_id` and `left_id`/`right_id` that it has. Other names are given here, as in `columns=('product_a', 'product_b')`.
 - `with_label`: also reads the column `label`, as 1.0, 0.0 or 2.0.
 - `df_type`: as in `read_table`.
 
 This function:
 
 1. Reads the file as `read_table` does, with the two id columns as 64-bit integers and `label` as a float.
-2. Finds the form of the pairs. When one of the two named columns is a list, the file is grouped, and each row is expanded into one pair per listed id, with the list `label` expanded alongside it. With the default names, a file with `id2` and `id1_list`, the grouped form of a blocker such as Sparkly, is read the same way.
-3. Returns the two id columns as `id1` and `id2`, and `label` with `with_label`. Other columns, such as a blocker's score, are not read.
+2. Finds the form of the pairs. When one of the two named columns is a list, the file is grouped, and each row is expanded into one pair per listed id, with the list `label` expanded alongside it. With the default names, a file with `id2` and `id1_list`, the grouped form that earlier blockers write, and that blockers write when asked for it, is read the same way.
+3. Returns the two id columns as `id1` and `id2`, and `label` with `with_label`. Other columns, such as a blocker's `blocking_score`, are not read.
 4. For `'arrow'`, opens as it is a Parquet file whose only columns are `id1`, `id2` and, with `with_label`, `label`. Any other file is written once as Parquet to the scratch directory and opened from there.
 
 **Returns:** a `pandas.DataFrame`, a `pyarrow.dataset.Dataset` or a `pyspark.sql.DataFrame` with the columns `id1`, `id2` and, with `with_label`, `label`.
 
-**Raises:** `ValueError` when the file has neither the two named columns nor the grouped form, when `with_label` is given and the file has no `label`, when the extension is not one of the three, or when `df_type` is unknown.
+**Raises:** `ValueError` when the file has none of the pairs of id columns looked for, nor the grouped form, when `with_label` is given and the file has no `label`, when the extension is not one of the four or does not match the contents of the file, or when `df_type` is unknown.
 
 **Example:**
 
 ```python
-candidates = iris.read_pairs('out/sparkly.csv', columns=('a_id', 'b_id'), df_type='arrow')
+candidates = iris.read_pairs('out/sparkly.csv', df_type='arrow')
+pairs = iris.read_pairs('out/blocker.parquet', columns=('product_a', 'product_b'))
 labeled = iris.read_pairs('data/dblp_acm/labeled_pairs.parquet', with_label=True)
 ```
 
@@ -125,7 +147,7 @@ def load_data(
 )
 ```
 
-Reads a Parquet file or directory as a pandas DataFrame, an Arrow dataset or a Spark DataFrame, with its columns as they are. `read_table` and `read_pairs` read the inputs of a run, and `load_data` reads anything else written as Parquet, such as saved predictions.
+Reads a Parquet file or directory as a pandas DataFrame, an Arrow dataset or a Spark DataFrame, with its columns as they are. `read_table` and `read_pairs` read the inputs of a run, and `load_data` reads anything else written as Parquet, such as the predicted matches.
 
 **Parameters:**
 
@@ -139,7 +161,7 @@ Reads a Parquet file or directory as a pandas DataFrame, an Arrow dataset or a S
 **Example:**
 
 ```python
-predictions = iris.load_data('examples/out/passive/predictions.parquet', 'pandas')
+matches = iris.load_data('examples/out/passive/matches.parquet', 'pandas')
 ```
 
 ### save_data()
@@ -151,19 +173,54 @@ def save_data(
 )
 ```
 
-Writes a pandas or Spark DataFrame to Parquet.
+Writes a pandas or Spark DataFrame to Parquet, under exactly the name given. A pandas DataFrame is written to a temporary name and renamed to `path` when the file is complete.
 
 **Parameters:**
 
 - `dataframe`: the frame to write.
 - `path`: a path, or for a Spark DataFrame a URI of storage that every machine of the cluster can read and write. On a cluster, a Spark DataFrame written to a path without a scheme such as `s3a://` is collected to the *driver*, the Python process that runs the script, and written there as one file, up to the limit `IRIS_MAX_DRIVER_ROWS`.
 
-**Raises:** `TypeError` for another kind of frame. `RuntimeError` when a Spark DataFrame would collect more rows to the driver than `IRIS_MAX_DRIVER_ROWS`.
+**Raises:** `ValueError` when the name of `path` ends in an extension other than `.parquet`. `TypeError` for another kind of frame. `RuntimeError` when a Spark DataFrame would collect more rows to the driver than `IRIS_MAX_DRIVER_ROWS`.
 
 **Example:**
 
 ```python
-iris.save_data(predictions[['id1', 'id2', 'prediction', 'confidence']], 'out/predictions.parquet')
+iris.save_data(labels, 'out/labels.parquet')
+```
+
+### save_predictions()
+
+```python
+def save_predictions(
+    predictions,                 # the result of apply_matcher, with prediction and confidence
+    path,                        # the Parquet file, or for Spark the directory, to write
+    threshold: float = 0.5,      # the probability of a match at or above which a pair is written
+) -> int
+```
+
+Writes the predicted matches to Parquet, as the columns `id1`, `id2` and `probability`. Runs on either engine.
+
+**Parameters:**
+
+- `predictions`: the result of `apply_matcher` with a `confidence_col`, as pandas, an Arrow dataset or a Spark DataFrame.
+- `path`: a path whose name ends in `.parquet` or has no extension. A pandas or Arrow result is written as one file, and a Spark result as `save_data` writes it.
+- `threshold`: a pair is written when its probability of being a match is at or above it. At 0.5 the pairs written are those whose `prediction` is 1.0.
+
+This function:
+
+1. Computes the probability of a match of each pair from its `prediction` and `confidence`.
+2. Keeps the pairs at or above `threshold`.
+3. Writes `id1`, `id2` and `probability` (float32) to a temporary name, and renames it to `path` when the file is complete.
+
+**Returns:** the number of matches written, as an `int`.
+
+**Raises:** `ValueError` when `predictions` has no `confidence` column, or when the name of `path` ends in an extension other than `.parquet`. `TypeError` for another kind of input.
+
+**Example:**
+
+```python
+predictions = iris.apply_matcher(matcher, fvs, 'feature_vectors', 'prediction', 'confidence')
+n = iris.save_predictions(predictions, 'out/matches.parquet')
 ```
 
 ### Converting the output of a blocker
@@ -175,7 +232,7 @@ def candidates_from_flat(
     pairs: pd.DataFrame,          # one row per pair
     a_col: str = 'id1',           # the column of table A's ids
     b_col: str = 'id2',           # the column of table B's ids
-    score_col: str = 'score',     # the blocker's score
+    score_col: str = 'blocking_score',  # the blocker's score, when the pairs have one
     sort_by_score: bool = True,   # order each list by descending score
 ) -> pd.DataFrame
 
@@ -184,9 +241,9 @@ def candidates_from_result(result, sort_by_score: bool = True) -> pd.DataFrame
 def write_flat_candidates(result, path, chunk_rows: int = 8_000_000) -> int
 ```
 
-`candidates_from_flat` groups a flat pandas pair table into the grouped form, with the columns `id2`, `id1_list` and `scores`. `candidates_from_result` does the same for the result object of a blocker that provides `iter_pairs()`, such as Sparkly's, without building the flat table. `write_flat_candidates` writes the pairs of such a result to a Parquet file as flat `(id1, id2, score)` rows, `chunk_rows` at a time, and returns the number of pairs written. Each function runs on the local engine.
+`candidates_from_flat` groups a flat pandas pair table into the grouped form, with the columns `id2`, `id1_list` and, when the pairs have a score in `score_col` or in `score`, `blocking_scores`. `candidates_from_result` does the same for the result object of a blocker that provides `iter_pairs()`, such as Sparkly's, without building the flat table. `write_flat_candidates` writes the pairs of such a result to a Parquet file as flat `(id1, id2, blocking_score)` rows, `chunk_rows` at a time, and returns the number of pairs written. It writes to a temporary name and renames it to `path` when the file is complete. Each function runs on the local engine.
 
-**Raises:** `ValueError` from `candidates_from_flat` when one of the three named columns is missing.
+**Raises:** `ValueError` from `candidates_from_flat` when one of the two id columns is missing, and from `write_flat_candidates` when the name of `path` ends in an extension other than `.parquet`.
 
 ## Checking the inputs
 
@@ -198,11 +255,11 @@ The `check_*` functions check the inputs before any work starts. `featurize` run
 def check_tables(table_a, table_b)
 ```
 
-Checks that each table has an `_id` column of unique, non-null integers. Runs on either engine.
+Checks that each table has an `_id` column of unique, non-null, non-negative integers. Runs on either engine.
 
 **Returns:** `{'table_a': int, 'table_b': int}`, the number of rows of each table.
 
-**Raises:** `ValueError` when a table is empty, has no `_id` column, or has null, non-integer or repeated ids.
+**Raises:** `ValueError` when a table is empty, has no `_id` column, or has null, non-integer, negative or repeated ids.
 
 ### check_candidates()
 
@@ -377,7 +434,7 @@ def featurize(
 )
 ```
 
-Computes the feature vector and the score of every candidate pair. Passing the same table object as `A` and `B` makes the run a deduplication of that table. Runs on either engine.
+Computes the feature vector and the score of every candidate pair. Passing the same table object as `A` and `B` makes the run a deduplication of that table, in which `featurize` drops the pairs of a record with itself and featurizes each pair once, as (smaller id, larger id). Runs on either engine.
 
 **Parameters:**
 
@@ -392,10 +449,10 @@ On the local engine, this function:
 1. Checks the inputs, and the free disk space for the feature vectors.
 2. Builds the vocabulary of each TF/IDF and SIF feature from the records of A and B. In a deduplication each record is counted once.
 3. Packs the records of A and B into a record store of scratch files, with each value preprocessed for the features, such as split into its tokens. In a deduplication there is one store.
-4. Sorts the candidate pairs into parts, dropping repeated pairs.
+4. Sorts the candidate pairs into parts, dropping repeated pairs. In a deduplication it first drops the pairs of a record with itself and orients each pair as (smaller id, larger id).
 5. Featurizes the parts with worker processes, each reading the records of its pairs from the store, and writes the feature vectors.
 
-On the Spark engine, this function joins the candidate pairs with the records of A and then with the records of B, and featurizes them in Spark's tasks.
+On the Spark engine, this function cleans the pairs of a deduplication in the same way, joins the candidate pairs with the records of A and then with the records of B, and featurizes them in Spark's tasks.
 
 **Returns:** for pandas tables, a `pandas.DataFrame` of the feature vectors. For Arrow tables on the local engine, a `pyarrow.dataset.Dataset` over the files written. For Spark DataFrames, a `pyspark.sql.DataFrame`. The columns are `id1`, `id2`, `output_col` and `score`.
 
@@ -687,7 +744,7 @@ Compares the predictions with a gold set. Runs on either engine.
 **Parameters:**
 
 - `threshold`: a pair is a predicted match when its probability of being a match is at or above it. At 0.5 it agrees with the column `prediction`.
-- `dedup`: counts (x, y) and (y, x) as one pair, by orienting the gold pairs so that `id1` is the smaller id. The candidate set must be oriented the same way, as `clean_candidates(canonicalize_mirrors=True)` orients it.
+- `dedup`: counts (x, y) and (y, x) as one pair, by orienting the gold pairs so that `id1` is the smaller id. The predictions must be oriented the same way, as `featurize` orients the pairs of a deduplication.
 
 **Returns:** a dictionary with the following keys.
 

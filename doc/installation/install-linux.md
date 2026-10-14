@@ -116,9 +116,9 @@ It does not use `sudo` and does not modify anything outside the `iris` directory
 [4/6] creating .venv
       OK: .venv/ created with Python 3.12
 [5/6] installing iris and its dependencies with pip, from PyPI (a few minutes)
-      OK: iris 0.1.0 installed
+      OK: iris 0.2.0 installed
 [6/6] smoke test
-iris 0.1.0
+iris 0.2.0
 python    3.12.3
 engine    local, up to 4 worker processes
 features  13
@@ -161,7 +161,7 @@ iris info
 ```
 
 ```
-iris      0.1.0
+iris      0.2.0
 python    3.12.3
 machine   31.3 GiB, 4 cores (cgroup (31.3 GiB / 4 cores; machine reports 31.3 GiB / 18))
 local     up to 4 worker processes, scratch in /tmp

@@ -105,9 +105,9 @@ def _sort(task, out_dir, by='id2'):
     return path, n_in, len(pairs)
 
 
-def canonical(cands, b_ids, directory, workers=None):
+def canonical(cands, b_ids, directory, workers=None, one_table=False):
     """Write the candidates as distinct pairs in parts ordered by `(id2, id1)`, and
-    return the parts and the repeats dropped."""
+    return the parts, the repeats dropped and, for one table, the self-pairs dropped."""
     workers = workers or workers_for(WORKER_GB)
     flat = is_flat(inputs.columns(cands))
     n = count(cands)
@@ -120,8 +120,9 @@ def canonical(cands, b_ids, directory, workers=None):
     os.makedirs(routed)
     with inputs.scratch() as tmp:
         src = inputs.stage(cands, tmp, 'candidates')
-        run_tasks(partial(_route, flat=flat, boundaries=boundaries, out_dir=routed),
-                  list(enumerate(inputs.chunks(src))), workers)
+        kept = run_tasks(partial(_route, flat=flat, boundaries=boundaries, out_dir=routed,
+                                 drop_self=one_table, orient=one_table),
+                         list(enumerate(inputs.chunks(src))), workers)
     tasks = [(k, os.path.join(routed, name))
              for k, name in enumerate(sorted(os.listdir(routed)))]
     out = run_tasks(partial(_sort, out_dir=directory), tasks, workers)
@@ -129,7 +130,7 @@ def canonical(cands, b_ids, directory, workers=None):
         for f in glob.glob(os.path.join(routed_part, '*.npy')):
             os.remove(f)
     repeats = sum(n_in - n_out for _, n_in, n_out in out)
-    return [(path, n_out) for path, _, n_out in out], repeats
+    return [(path, n_out) for path, _, n_out in out], repeats, n - sum(kept)
 
 
 def clean(cands, drop_self_pairs=False, canonicalize_mirrors=False, directory=None,

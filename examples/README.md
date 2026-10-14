@@ -8,7 +8,7 @@ All scripts except `run_dedup.py` use the dataset `data/dblp_acm`, which consist
 
 ### run_passive.py (Part 1 of the tutorial)
 
-This is the shortest complete workflow. It reads the tables with `read_table` and the candidate set, the gold set and the 550 labeled pairs with `read_pairs`, checks them, creates the features, featurizes the labeled pairs, trains a matcher on them, applies it to the candidate set, evaluates the result against the gold set, and saves the features and the predictions.
+This is the shortest complete workflow. It reads the tables with `read_table` and the candidate set, the gold set and the 550 labeled pairs with `read_pairs`, checks them, creates the features, featurizes the labeled pairs, trains a matcher on them, applies it to the candidate set, evaluates the result against the gold set, and saves the features and the predicted matches.
 
 ### run_features.py (Part 2)
 

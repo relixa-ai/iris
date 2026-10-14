@@ -543,10 +543,18 @@ def load_features(path):
 
 def save_data(dataframe, path):
     """Write a pandas or Spark DataFrame to `path` as Parquet."""
-    path = os.fspath(path)
+    from .io import parquet_name
+    path = parquet_name(path, 'save_data')
     if isinstance(dataframe, pd.DataFrame):
         logger.info(f"Saving pandas DataFrame with shape {dataframe.shape} to {path}")
-        dataframe.to_parquet(files.local_path(path))
+        local = files.local_path(path)
+        partial = f"{local}.partial-{os.getpid()}"
+        try:
+            dataframe.to_parquet(partial)
+            os.replace(partial, local)
+        finally:
+            if os.path.exists(partial):
+                os.remove(partial)
         logger.info(f"Successfully saved pandas DataFrame to {path}")
     elif is_spark(dataframe):
         from ._spark import steps
@@ -554,6 +562,25 @@ def save_data(dataframe, path):
     else:
         raise TypeError(f"Unsupported DataFrame type: {type(dataframe)}. "
                        f"Expected pandas.DataFrame or pyspark.sql.DataFrame")
+
+
+def save_predictions(predictions, path, threshold: float = 0.5) -> int:
+    """Write the predicted matches, the pairs whose probability of a match is at or above
+    `threshold`, to Parquet as `id1`, `id2` and `probability`, and return their number."""
+    from .io import parquet_name, _columns
+    path = parquet_name(path, 'save_predictions')
+    missing = [c for c in ('id1', 'id2', 'prediction', 'confidence') if c not in _columns(predictions)]
+    if missing:
+        raise ValueError(f'save_predictions needs the columns {missing}; pass the result of '
+                         f"apply_matcher(..., 'prediction', 'confidence')")
+    if is_spark(predictions):
+        from ._spark import steps
+        return steps.save_matches(predictions, path, threshold)
+    if isinstance(predictions, pd.DataFrame) or is_arrow(predictions):
+        from ._local.apply import save_matches
+        return save_matches(predictions, files.local_path(path), threshold)
+    raise TypeError(f'predictions must be a pandas DataFrame, an Arrow dataset or a Spark '
+                    f'DataFrame (got {type(predictions)})')
 
 
 def load_data(path, df_type):
@@ -590,8 +617,8 @@ def read_table(
     columns: Optional[List[str]] = None,
     df_type: str = 'pandas',
 ):
-    """Read a table of records from a Parquet, CSV or TSV file, with its id column named
-    `_id`."""
+    """Read a table of records from a Parquet, CSV, TSV or JSON Lines file, with its id
+    column named `_id`."""
     from .io import file_format, table_columns
 
     kind = _reader_type(df_type)
@@ -618,9 +645,9 @@ def read_pairs(
     with_label: bool = False,
     df_type: str = 'pandas',
 ):
-    """Read a set of pairs from a Parquet, CSV or TSV file as flat `id1`, `id2` rows, with
-    `label` when `with_label` is True."""
-    from .io import file_format, pair_layout
+    """Read a set of pairs from a Parquet, CSV, TSV or JSON Lines file as flat `id1`, `id2`
+    rows, with `label` when `with_label` is True."""
+    from .io import PAIR_ID_NAMES, file_format, pair_layout
 
     kind = _reader_type(df_type)
     fmt = file_format(path)
@@ -634,7 +661,8 @@ def read_pairs(
 
     from ._local import readers
     path = files.local_path(path)
-    src = readers.source(path, fmt, {**{c: pa.int64() for c in columns}, 'label': pa.float64()})
+    src = readers.source(path, fmt, {**{c: pa.int64() for c in PAIR_ID_NAMES + columns},
+                                     'label': pa.float64()})
     schema = src.schema
     grouped, x, y, list_is_a = pair_layout(
         path, schema.names,

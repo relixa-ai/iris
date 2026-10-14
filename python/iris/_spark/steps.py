@@ -177,8 +177,11 @@ def _read_frame(path, fmt, types):
     if fmt == 'parquet':
         from ..io import read_parquet
         return read_parquet(spark, path)
-    df = (spark.read.option('header', True)
-          .option('sep', '\t' if fmt == 'tsv' else ',').csv(path))
+    if fmt == 'jsonl':
+        df = spark.read.json(path)
+    else:
+        df = (spark.read.option('header', True)
+              .option('sep', '\t' if fmt == 'tsv' else ',').csv(path))
     for name, typ in types.items():
         if name in df.columns:
             df = df.withColumn(name, F.col(f'`{name}`').cast(typ))
@@ -195,8 +198,8 @@ def read_table(path, fmt, id_col, columns):
 
 def read_pairs(path, fmt, columns, with_label):
     """Return pairs read with Spark as flat `id1`, `id2` and, with `with_label`, `label`."""
-    from ..io import pair_layout
-    df = _read_frame(path, fmt, {c: 'long' for c in columns} | {'label': 'double'})
+    from ..io import PAIR_ID_NAMES, pair_layout
+    df = _read_frame(path, fmt, {c: 'long' for c in PAIR_ID_NAMES + columns} | {'label': 'double'})
     types = dict(df.dtypes)
     grouped, x, y, list_is_a = pair_layout(
         path, df.columns, lambda c: types.get(c, '').startswith('array'), columns, with_label)
@@ -291,6 +294,20 @@ def save_data(dataframe, path):
     logger.info(f"Saving Spark DataFrame to {path}")
     dataframe.write.mode('overwrite').parquet(str(path))
     logger.info(f"Successfully saved Spark DataFrame to {path}")
+
+
+def save_matches(predictions, path, threshold):
+    """Write the predicted matches at `threshold` as `id1`, `id2` and `probability`, and
+    return their number."""
+    p_match = F.when(F.col('prediction') == 1.0, F.col('confidence')) \
+               .otherwise(F.lit(1.0) - F.col('confidence'))
+    pos = (F.col('prediction') == 1.0) if threshold == 0.5 else (p_match >= threshold)
+    matches = predictions.filter(pos).select(
+        F.col('id1').cast('long').alias('id1'), F.col('id2').cast('long').alias('id2'),
+        p_match.cast('float').alias('probability'))
+    n = matches.count()
+    save_data(matches, path)
+    return n
 
 
 def load_data(path):

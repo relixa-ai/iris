@@ -49,5 +49,5 @@ print(f"pool {len(pool)}  labels {len(labeled)}  "
 print(f"precision {metrics['precision']:.4f}  recall {metrics['recall']:.4f}  "
       f"f1 {metrics['f1']:.4f}")
 
-iris.save_data(predictions[['id1', 'id2', 'prediction', 'confidence']],
-               f'{OUT}/predictions.parquet')
+iris.save_predictions(predictions, f'{OUT}/matches.parquet')
+# -> int                       the predicted matches written, as id1, id2 and probability

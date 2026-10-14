@@ -62,7 +62,7 @@ The script prints the output of the packages it installs, and its own lines, whi
 
 ```
 [spark-node] Java: openjdk version "17.0.20.1" 2026-08-18
-[spark-node] Iris 0.1.0 with Python 3.12.3 and Spark 3.5.3
+[spark-node] Iris 0.2.0 with Python 3.12.3 and Spark 3.5.3
 [spark-node] storage: s3a
 [spark-node] scratch: /mnt/scratch, 840G free
 [spark-node] master: spark://172.18.0.3:7077 (web UI on port 8080)
@@ -80,7 +80,7 @@ You should see lines like the following:
 
 ```
 [spark-node] Java: openjdk version "17.0.20.1" 2026-08-18
-[spark-node] Iris 0.1.0 with Python 3.12.3 and Spark 3.5.3
+[spark-node] Iris 0.2.0 with Python 3.12.3 and Spark 3.5.3
 [spark-node] storage: s3a
 [spark-node] scratch: /mnt/scratch, 840G free
 [spark-node] worker: joined spark://iris-master:7077 with 18 cores
