@@ -6,6 +6,7 @@ import pyspark.sql.functions as F
 import pyspark.sql.types as T
 
 from .._core.textform import unsupported
+from .utils import map_in_arrow
 
 _TEXT_TYPES = (T.BooleanType, T.ByteType, T.ShortType, T.IntegerType, T.LongType,
                T.FloatType, T.DoubleType, T.DecimalType, T.DateType, T.TimestampType,
@@ -48,7 +49,7 @@ def text_columns(df, cols, tz, suffix=None):
                 arrays += [to_text(batch.column(c), tz, c) for c in cols]
             yield pa.RecordBatch.from_arrays(arrays, names=names)
 
-    return df.mapInArrow(fmt, schema)
+    return map_in_arrow(df, fmt, schema)
 
 
 def tokens_column(tokenizer, input_col):

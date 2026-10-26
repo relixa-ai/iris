@@ -7,7 +7,7 @@ source ./config.env
 source ./.cluster
 STAMP=$(date +%Y%m%d-%H%M%S)
 JOB=jobs/$STAMP-$(basename "$SCRIPT")
-SSH=(ssh -i "$KEY_FILE" -o ConnectTimeout=10 "ubuntu@$DRIVER_PUBLIC")
+SSH=(ssh -i "$KEY_FILE" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 "ubuntu@$DRIVER_PUBLIC")
 "${SSH[@]}" mkdir -p jobs
 scp -q -i "$KEY_FILE" "$SCRIPT" "ubuntu@$DRIVER_PUBLIC:$JOB"
 ARGS=

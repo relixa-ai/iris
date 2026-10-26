@@ -18,7 +18,7 @@ Contents:
 
 ## Conventions and data shapes
 
-Every function is imported from the package `iris`, as in `iris.featurize`. Each function runs on the *local engine*, which uses Python processes on one machine, when it is given pandas DataFrames or Arrow tables and datasets, and on the *Spark engine*, as Spark jobs, when it is given Spark DataFrames. [How Iris works](how-it-works.md#the-two-engines) describes both. The inputs of one call are all of one kind, and a function returns the kind it was given, except where an entry says otherwise. The entries below say "Runs on either engine." when this is so.
+Every function is imported from the package `iris`, as in `iris.featurize`. Each function runs on the *local engine*, which uses Python processes on one machine, when it is given pandas DataFrames or Arrow tables and datasets, and on the *Spark engine*, as Spark jobs, when it is given Spark DataFrames. [How Iris works](how-it-works.md#the-two-engines) describes both. The inputs of one call are all of one kind, and a function returns the kind it was given, except where an entry says otherwise. An Arrow dataset that is filtered with `Dataset.filter`, or partitioned into directories, is read by every function with its filter and its partition columns. The entries below say "Runs on either engine." when this is so.
 
 The data of a run has the following shapes.
 
@@ -59,11 +59,11 @@ gold.to_parquet('gold.parquet', index=False)
 
 ### File formats
 
-`read_table` and `read_pairs` read the tables and the sets of pairs from Parquet files, directories of Parquet files, CSV files, TSV files and JSON Lines files, with any names for their id columns, and give them the column names of Iris. A file is recognised as Parquet by its contents. A file named `.parquet` that holds CSV text, or a CSV or TSV file that holds Parquet data, is refused with a message, and a file without an extension is read when it holds Parquet data. The feature vectors and the predicted matches are written as Parquet, and a function that writes Parquet refuses a path whose name ends in another extension. A directory written by Spark or by a function of Iris holds a file `_SUCCESS` when it was written to completion. The directory of feature vectors written by `featurize` also holds a file `_iris.json`, which lists the features that made them.
+`read_table` and `read_pairs` read the tables and the sets of pairs from Parquet files, directories of Parquet files, CSV files, TSV files and JSON Lines files, with any names for their id columns, and give them the column names of Iris. A file is recognized as Parquet by its contents. A file whose name ends in `.parquet` but that holds other data, or a CSV, TSV or JSON Lines file that holds Parquet data, is refused with a message, and a file without an extension is read when it holds Parquet data. The feature vectors and the predicted matches are written as Parquet, and a function that writes Parquet refuses a path whose name ends in another extension. A directory written by Spark or by a function of Iris holds a file `_SUCCESS` when it was written to completion. The directory of feature vectors written by `featurize` also holds a file `_iris.json`, which lists the features that made them.
 
-A Parquet file is read in *row groups*. The local engine reads a table a row group at a time, and a labeler that looks up a record reads the row group that holds it. Tables written with row groups of about 65,536 rows keep both the memory of each read and the time of each lookup small, as `pyarrow.parquet.write_table(table, path, row_group_size=65536)` does.
+A Parquet file is read in *row groups*. The local engine reads an input in small batches of rows, regardless of the size of its row groups. Before a step that divides an input among worker processes, it copies the input once to the scratch directory, in small row groups, when the input is held in memory, is filtered or partitioned, has row groups too large or too few to give each worker process its own, or consists of many files far smaller than the part a worker process takes. A labeler that looks up a record reads the row group that holds it. Tables written with row groups of about 65,536 rows keep both the memory and the time of each lookup small, as `pyarrow.parquet.write_table(table, path, row_group_size=65536)` does.
 
-### read_table()
+### `read_table()`
 
 ```python
 def read_table(
@@ -85,22 +85,23 @@ Reads a table of records, with its id column named `_id`. Runs on either engine.
 
 This function:
 
-1. Reads a Parquet file with the types it has. Reads a CSV or TSV file, whose first line names the columns, with the id as a 64-bit integer and every other column as text, an empty cell being a missing value. Reads a JSON Lines file, one JSON object per line, with the id as a 64-bit integer and every other key as JSON gives it.
+1. Reads a Parquet file with the types it has. Reads a CSV or TSV file, whose first line names the columns, with the id as a 64-bit integer and every other column as text, an empty cell being a missing value. For `'pandas'` and `'arrow'`, a quoted value may hold line breaks. Reads a JSON Lines file, one JSON object per line, with the id as a 64-bit integer and every other key as JSON gives it. A CSV, TSV or JSON Lines file is read as UTF-8 text.
 2. Checks that the id column exists, and that the file has no other column named `_id`.
 3. Renames the id column to `_id` and keeps the columns asked for.
 4. For `'arrow'`, opens a Parquet file that needs no renaming as it is, without reading it. Any other file is written once as Parquet to the scratch directory, a batch at a time, and opened from there.
+5. For `'sparkdf'`, reads a Parquet file that has a decimal column of more than 38 digits, which Spark cannot read, only when `columns` leaves that column out.
 
 **Returns:** a `pandas.DataFrame`, a `pyarrow.dataset.Dataset` or a `pyspark.sql.DataFrame` with the column `_id` and the attribute columns.
 
-**Raises:** `ValueError` when the id column or a column of `columns` is missing, when the file has both `_id` and another id column, when the extension is not one of the four or does not match the contents of the file, or when `df_type` is unknown.
+**Raises:** `ValueError` when the id column or a column of `columns` is missing, when the file has both `_id` and another id column, when the extension is not one of the four or does not match the contents of the file, or when `df_type` is unknown. `ValueError` also when a CSV, TSV or JSON Lines file holds a value it cannot read, such as an id that is not a whole number or text that is not UTF-8, with a message that names the row or the column, and on Spark when a column it reads is a decimal of more than 38 digits.
 
 **Example:**
 
 ```python
-table_a = iris.read_table('data/abt_buy/table_a.csv', id_col='product_id', df_type='arrow')
+table_a = iris.read_table('table_a.csv', id_col='product_id', df_type='arrow')
 ```
 
-### read_pairs()
+### `read_pairs()`
 
 ```python
 def read_pairs(
@@ -122,13 +123,13 @@ Reads a set of pairs, which can be a candidate set, a gold set or labeled pairs,
 This function:
 
 1. Reads the file as `read_table` does, with the two id columns as 64-bit integers and `label` as a float.
-2. Finds the form of the pairs. When one of the two named columns is a list, the file is grouped, and each row is expanded into one pair per listed id, with the list `label` expanded alongside it. With the default names, a file with `id2` and `id1_list`, the grouped form that earlier blockers write, and that blockers write when asked for it, is read the same way.
+2. Finds the form of the pairs. When one of the two named columns is a list, the file is grouped, and each row is expanded into one pair per listed id, with the list `label` expanded alongside it. With the default names, a file with `id2` and `id1_list`, the grouped form that some blockers write, is read the same way.
 3. Returns the two id columns as `id1` and `id2`, and `label` with `with_label`. Other columns, such as a blocker's `blocking_score`, are not read.
-4. For `'arrow'`, opens as it is a Parquet file whose only columns are `id1`, `id2` and, with `with_label`, `label`. Any other file is written once as Parquet to the scratch directory and opened from there.
+4. For `'arrow'`, opens a Parquet file as it is when its only columns are `id1`, `id2` and, with `with_label`, `label`. Any other file is written once as Parquet to the scratch directory and opened from there.
 
 **Returns:** a `pandas.DataFrame`, a `pyarrow.dataset.Dataset` or a `pyspark.sql.DataFrame` with the columns `id1`, `id2` and, with `with_label`, `label`.
 
-**Raises:** `ValueError` when the file has none of the pairs of id columns looked for, nor the grouped form, when `with_label` is given and the file has no `label`, when the extension is not one of the four or does not match the contents of the file, or when `df_type` is unknown.
+**Raises:** `ValueError` when the file has none of the pairs of id columns looked for, nor the grouped form, when `with_label` is given and the file has no `label`, when the extension is not one of the four or does not match the contents of the file, or when `df_type` is unknown. `ValueError` also when a text file holds a value it cannot read, as in `read_table`, and on Spark when an id column or `label` is a decimal of more than 38 digits.
 
 **Example:**
 
@@ -138,7 +139,7 @@ pairs = iris.read_pairs('out/blocker.parquet', columns=('product_a', 'product_b'
 labeled = iris.read_pairs('data/dblp_acm/labeled_pairs.parquet', with_label=True)
 ```
 
-### load_data()
+### `load_data()`
 
 ```python
 def load_data(
@@ -152,7 +153,7 @@ Reads a Parquet file or directory as a pandas DataFrame, an Arrow dataset or a S
 **Parameters:**
 
 - `path`: a path, or a URI such as `s3a://bucket/path` when `df_type` is `'sparkdf'`.
-- `df_type`: `'pandas'` reads the whole file into memory. `'arrow'` opens it as an Arrow dataset and reads nothing yet. The local engine then reads it a row group at a time. `'sparkdf'` reads it with the active Spark session.
+- `df_type`: `'pandas'` reads the whole file into memory. `'arrow'` opens it as an Arrow dataset and reads nothing yet. The local engine then reads it a row group at a time. A dataset filtered with `Dataset.filter` is read with its filter, through Arrow's scanner. `'sparkdf'` reads it with the active Spark session.
 
 **Returns:** a `pandas.DataFrame`, a `pyarrow.dataset.Dataset` or a `pyspark.sql.DataFrame`.
 
@@ -164,7 +165,7 @@ Reads a Parquet file or directory as a pandas DataFrame, an Arrow dataset or a S
 matches = iris.load_data('examples/out/passive/matches.parquet', 'pandas')
 ```
 
-### save_data()
+### `save_data()`
 
 ```python
 def save_data(
@@ -188,7 +189,7 @@ Writes a pandas or Spark DataFrame to Parquet, under exactly the name given. A p
 iris.save_data(labels, 'out/labels.parquet')
 ```
 
-### save_predictions()
+### `save_predictions()`
 
 ```python
 def save_predictions(
@@ -214,7 +215,7 @@ This function:
 
 **Returns:** the number of matches written, as an `int`.
 
-**Raises:** `ValueError` when `predictions` has no `confidence` column, or when the name of `path` ends in an extension other than `.parquet`. `TypeError` for another kind of input.
+**Raises:** `ValueError` when `predictions` lacks one of the columns `id1`, `id2`, `prediction` and `confidence`, when `threshold` is not a number from 0 to 1, or when the name of `path` ends in an extension other than `.parquet`. `TypeError` for another kind of input.
 
 **Example:**
 
@@ -243,13 +244,13 @@ def write_flat_candidates(result, path, chunk_rows: int = 8_000_000) -> int
 
 `candidates_from_flat` groups a flat pandas pair table into the grouped form, with the columns `id2`, `id1_list` and, when the pairs have a score in `score_col` or in `score`, `blocking_scores`. `candidates_from_result` does the same for the result object of a blocker that provides `iter_pairs()`, such as Sparkly's, without building the flat table. `write_flat_candidates` writes the pairs of such a result to a Parquet file as flat `(id1, id2, blocking_score)` rows, `chunk_rows` at a time, and returns the number of pairs written. It writes to a temporary name and renames it to `path` when the file is complete. Each function runs on the local engine.
 
-**Raises:** `ValueError` from `candidates_from_flat` when one of the two id columns is missing, and from `write_flat_candidates` when the name of `path` ends in an extension other than `.parquet`.
+**Raises:** `ValueError` from `candidates_from_flat` when one of the two id columns is missing or holds a null id, and from `write_flat_candidates` when the name of `path` ends in an extension other than `.parquet`.
 
 ## Checking the inputs
 
 The `check_*` functions check the inputs before any work starts. `featurize` runs the same checks on its inputs unless it is given `validate=False`. Each function raises an error that names the invalid ids, and the messages are listed in [Troubleshooting](troubleshooting.md#checking-the-inputs).
 
-### check_tables()
+### `check_tables()`
 
 ```python
 def check_tables(table_a, table_b)
@@ -261,7 +262,7 @@ Checks that each table has an `_id` column of unique, non-null, non-negative int
 
 **Raises:** `ValueError` when a table is empty, has no `_id` column, or has null, non-integer, negative or repeated ids.
 
-### check_candidates()
+### `check_candidates()`
 
 ```python
 def check_candidates(
@@ -292,7 +293,7 @@ This function:
 
 **Raises:** `ValueError` when a check fails. `TypeError` when the inputs mix Arrow datasets and Spark DataFrames.
 
-### check_gold_data(), check_labeled_data() and check_pairs()
+### `check_gold_data()`, `check_labeled_data()` and `check_pairs()`
 
 ```python
 def check_gold_data(gold, table_a, table_b)
@@ -304,7 +305,7 @@ def check_pairs(pairs, table_a, table_b, what='gold')
 
 **Raises:** `ValueError` when a column is missing or an id names no record. `TypeError` for an input that is not a DataFrame.
 
-### clean_candidates()
+### `clean_candidates()`
 
 ```python
 def clean_candidates(
@@ -339,7 +340,7 @@ candidates = iris.clean_candidates(candidates, drop_self_pairs=True, canonicaliz
 
 ## Features and feature vectors
 
-### create_features()
+### `create_features()`
 
 ```python
 def create_features(
@@ -362,7 +363,7 @@ Selects the features for the given columns from the contents of the tables. Runs
 **Parameters:**
 
 - `a_cols` and `b_cols`: the columns compared, pair by pair. The tutorial passes the same list for both.
-- `sim_functions` and `tokenizers`: the similarity functions and the tokenizers to choose from. `get_base_sim_functions()` and `get_base_tokenizers()` return the defaults, and `get_extra_tokenizers()` four more.
+- `sim_functions` and `tokenizers`: the similarity functions and the tokenizers to select from. `get_base_sim_functions()` and `get_base_tokenizers()` return the defaults, and `get_extra_tokenizers()` four more.
 - `null_threshold`: a column empty in this share or more of the rows of A and B, counted together, is not used.
 - `numeric_threshold`: a column of text whose values parse as numbers in at least this share of rows is treated as numeric. `None` treats as numeric only the columns whose type is numeric.
 - `min_doc_freq` and `max_vocab_size`: bound the vocabulary of the TF/IDF features.
@@ -374,10 +375,11 @@ This function:
 2. Detects the numeric columns, by type or by `numeric_threshold`.
 3. Counts the tokens of each column under each tokenizer.
 4. Returns an exact-match feature for every column kept, a relative-difference feature for every numeric column, and for every tokenizer under which a column averages at least three tokens, one feature per similarity function. With the alphanumeric tokenizer, a column that averages at most ten tokens also gets the Monge-Elkan, edit-distance and Smith-Waterman features.
+5. Logs a warning for each column whose longest values in A and B would make its edit-distance or Smith-Waterman features slow on a single pair, as [Troubleshooting](troubleshooting.md#features-and-feature-vectors) describes.
 
 **Returns:** a list of features. `str(f)` names a feature, such as `jaccard(3gram_tokens(title), 3gram_tokens(title))`, and `f.a_attr` and `f.b_attr` name its columns.
 
-**Raises:** `ValueError` for a `numeric_threshold` outside 0 to 1, or an unknown time zone. `TypeError` for a column whose type has no text form.
+**Raises:** `ValueError` for a `numeric_threshold` outside 0 to 1, or an unknown time zone. `ValueError`, before any work, when a column of `a_cols` or `b_cols` is not in its table or is `_id`, or when a table has two columns of one name or a column name that is not a string. `ValueError` for a text column that is not valid UTF-8, or a pandas column that mixes types. `TypeError` for a column whose type has no text form, or an entry of `sim_functions` that is not a similarity class such as those of `get_base_sim_functions()`.
 
 **Example:**
 
@@ -393,7 +395,7 @@ Each feature compares a column of A with the column of B at the same position in
 | Feature | Name | Value |
 | --- | --- | --- |
 | Exact match | `exact_match(c, c)` | 1.0 when the two values are equal, ignoring case, else 0.0. |
-| Relative difference | `rel_diff(c, c)` | `|x − y| / max(|x|, |y|)` for two numbers. |
+| Relative difference | `rel_diff(c, c)` | `\|x - y\| / max(\|x\|, \|y\|)` for two numbers. |
 | TF/IDF | `tf_idf_<tokenizer>(c, c)` | The cosine of the two token vectors, each token weighted by its rarity in the tables. |
 | SIF | `sif_<tokenizer>(c, c)` | The cosine of the two token vectors under smooth inverse-frequency weights. |
 | Jaccard | `jaccard(<tokenizer>(c), <tokenizer>(c))` | The size of the intersection of the two token sets over the size of their union. |
@@ -418,7 +420,7 @@ When either record's value of a column is empty, the features of that column are
 
 A set of features is a Python list, and can be filtered, reordered or extended before `featurize` is called, as Part 2 of the tutorial shows. A matcher must be applied to feature vectors of the set it was trained on, in the same order.
 
-### featurize()
+### `featurize()`
 
 ```python
 def featurize(
@@ -442,7 +444,7 @@ Computes the feature vector and the score of every candidate pair. Passing the s
 - `candidates`: the candidate set. A pair that appears more than once is featurized once, with a warning.
 - `fill_na`: the value written for a feature whose column is empty in either record of the pair.
 - `validate`: runs `check_candidates` on the inputs first.
-- `out`: a directory, or on Spark a URI, to write the feature vectors to as Parquet. An existing directory at `out` is replaced. Without `out`, the local engine writes them to scratch files, and the Spark engine returns a DataFrame that is computed again each time it is used.
+- `out`: a directory, or on Spark a URI, to write the feature vectors to as Parquet. An existing directory at `out` is replaced. Without `out`, the local engine writes them to scratch files, and the Spark engine returns a DataFrame that is computed again each time it is used, from the packed records it keeps persisted until the next `featurize` of the session or the session's end. With `out`, the feature vectors are written once and `featurize` releases everything it persisted.
 
 On the local engine, this function:
 
@@ -456,7 +458,7 @@ On the Spark engine, this function cleans the pairs of a deduplication in the sa
 
 **Returns:** for pandas tables, a `pandas.DataFrame` of the feature vectors. For Arrow tables on the local engine, a `pyarrow.dataset.Dataset` over the files written. For Spark DataFrames, a `pyspark.sql.DataFrame`. The columns are `id1`, `id2`, `output_col` and `score`.
 
-**Raises:** the errors of `check_candidates`. `RuntimeError` when the disk cannot hold the feature vectors, or when pandas tables would bring more than `IRIS_MAX_DRIVER_ROWS` feature vectors into memory.
+**Raises:** the errors of `check_candidates`. `ValueError` when `features` is empty, or when the ids of a table repeat, which `featurize` checks also with `validate=False`. `ValueError` on the local engine when a table has two columns of one name among `_id` and the columns the features read. `RuntimeError` when the disk cannot hold the feature vectors, or when pandas tables would bring into memory more feature vectors than `IRIS_MAX_DRIVER_ROWS`, or more bytes than the memory Iris may use.
 
 **Example:**
 
@@ -464,20 +466,20 @@ On the Spark engine, this function cleans the pairs of a deduplication in the sa
 fvs = iris.featurize(features, table_a, table_b, candidates, out='out/fvs.parquet')
 ```
 
-### save_features() and load_features()
+### `save_features()` and `load_features()`
 
 ```python
 def save_features(features, path)
 def load_features(path)
 ```
 
-`save_features` writes a list of features to a file, and `load_features` reads it back. A path is a file of this machine. A URI, such as `s3a://bucket/run/features.pkl`, is written and read through the active Spark session.
+`save_features` writes a list of features to a file, and `load_features` reads it back. A path is a file of this machine. A URI, such as `s3a://bucket/run/features.pkl`, is written and read through the active Spark session. The file begins with the line `iris-features` and a line of JSON that records the version of its format and the version of Iris that wrote it, followed by the pickled list. `load_features` reads files of this format and earlier ones, including the files of earlier versions of Iris, which have no such lines. Loading a features file runs code from it, as unpickling does, so load only files you made or trust.
 
-**Raises:** `FileNotFoundError` from `load_features` when the file does not exist.
+**Raises:** `FileNotFoundError` from `load_features` when the file does not exist, and `ValueError` when it was written by a later Iris in a format this one does not read, or when its first two lines are damaged.
 
 ## The pool and active learning
 
-### down_sample()
+### `down_sample()`
 
 ```python
 def down_sample(
@@ -515,7 +517,7 @@ This function:
 pool = iris.down_sample(fvs, percent=0.3, seed=42)
 ```
 
-### create_seeds()
+### `create_seeds()`
 
 ```python
 def create_seeds(
@@ -533,18 +535,19 @@ Collects the first labels of active learning, from both ends of the score rankin
 
 - `nseeds`: the number of labels to collect. More are collected when the first `nseeds` do not include a match and a non-match.
 - `labeler`: the labeler that labels each pair.
-- `checkpoint_path`: the file that every label is written to as it is collected, by default in the current directory, or a URI on Spark.
+- `checkpoint_path`: the file that the labels are written to while they are collected, as [Checkpoints and resuming](#checkpoints-and-resuming) describes, by default in the current directory, or a URI on Spark.
 
 This function:
 
-1. When the checkpoint file exists, returns up to `nseeds` of the labels in it instead, with a warning.
-2. Ranks the pool by score, and examines up to 50 × `nseeds` pairs from each end.
+1. Checks that a local `checkpoint_path` can be written. When the checkpoint file exists, starts from the labels in it, with a warning, and returns the first `nseeds` of them when it holds that many.
+2. Ranks the pool by score, and examines up to 50 × `nseeds` pairs from each end. With a `GoldLabeler`, a pool without a score column, and on the local engine a pool whose scores are all missing, is ranked by the gold set instead, 1.0 for a gold pair and 0.0 for any other.
 3. Asks the labeler about pairs from the high end and the low end in turn, taking the next pair from the end of the class that has fewer labels so far, until it has `nseeds` labels with both classes.
 4. Sets aside a pair labeled unsure, and stops at a stop label.
+5. Writes the labels to the checkpoint file while it collects them, as [Checkpoints and resuming](#checkpoints-and-resuming) describes, and writes the last of them before it returns or raises an error.
 
-**Returns:** the labeled pairs, with the columns of the pool and `label`, as a frame of the kind of the pool.
+**Returns:** the labeled pairs, with the columns of the pool and `label`, as a pandas DataFrame for a pandas or Arrow pool and a Spark DataFrame for a Spark pool.
 
-**Raises:** `ValueError` when `nseeds` is not positive. `RuntimeError` when the labeler stops before any pair is labeled.
+**Raises:** `ValueError` when `nseeds` is not positive, when the pool is empty, when fewer pairs of the pool have a score than `nseeds`, or when the labeler returns a value that is not one of [the contract](#the-contract). `FileNotFoundError` or `PermissionError`, before any pair is labeled, when a local `checkpoint_path` cannot be written. `RuntimeError` when the labeler stops before any pair is labeled.
 
 **Example:**
 
@@ -552,7 +555,7 @@ This function:
 seeds = iris.create_seeds(pool, 50, iris.GoldLabeler(gold), checkpoint_path='out/labeled.parquet')
 ```
 
-### label_al()
+### `label_al()`
 
 ```python
 def label_al(
@@ -572,7 +575,7 @@ Collects labels by active learning over the pool. Runs on either engine.
 
 - `fvs`: the pool, from `down_sample`, or the feature vectors themselves, as they were returned by `featurize`, when the candidate set has at most 10,000,000 pairs. Feature vectors on disk are copied once to a memory-mapped file in the scratch directory.
 - `mode`: `'batch'` or `'continuous'`, as described in [How Iris works](how-it-works.md#active-learning).
-- `seeds`: the first labels. They must include a match and a non-match.
+- `seeds`: the first labels. They must include a match and a non-match. With `None`, `label_al` first collects 10 seeds with `create_seeds`.
 - `checkpoint_path`: as in `create_seeds`. When the file holds labels beyond the seeds, labeling resumes from them, with a warning.
 
 The options of batch mode are the following:
@@ -585,18 +588,18 @@ The options of continuous mode are the following:
 
 - `queue_size` (50): the number of selected pairs kept ready for the labeler.
 - `max_labeled` (550): the number of labels after which labeling ends.
-- `on_demand_stop` (`True`): whether the labeler's stop label ends the labeling.
+- `on_demand_stop` (`True`): whether the labeler's stop label ends the labeling. While it is `True`, `max_labeled` is ignored, so with a `GoldLabeler`, which never gives the stop label, labeling goes on until every pair of the pool is labeled, and `label_al` logs a warning that says so.
 
 This function, in batch mode:
 
 1. Trains the matcher on the labels collected so far.
 2. Scores every unlabeled pair of the pool and selects `batch_size` of them by `selection`. Pairs of equal uncertainty are ordered by a hash of the pair.
-3. Asks the labeler about each, writes each label to the checkpoint file, and sets aside the pairs labeled unsure.
-4. Repeats for `max_iter` rounds, or until the labeler stops.
+3. Asks the labeler about each, sets aside the pairs labeled unsure, and writes the labels of the round to the checkpoint file.
+4. Repeats for `max_iter` rounds, until the labeler stops, or until every pair of the pool is labeled.
 
-**Returns:** the labeled pairs, seeds included, with the columns `id1`, `id2`, `feature_vectors`, `label` and `labeled_in_iteration`. On the Spark engine the result is a pandas DataFrame, since the labels are collected on the driver.
+**Returns:** the labeled pairs, seeds included, with the columns `id1`, `id2`, `feature_vectors`, `label` and `labeled_in_iteration`. On the local engine the result is a pandas DataFrame, also for an Arrow pool. On the Spark engine it is a Spark DataFrame of the labels collected on the driver.
 
-**Raises:** `ValueError` for an unknown `mode` or `selection`, or a non-positive `batch_size` or `max_iter`. `RuntimeError` when the seeds do not hold both classes. `ValueError` when the checkpoint file holds feature vectors of another length, which happens when it is left from another run.
+**Raises:** `ValueError` for an unknown `mode` or `selection`, or a non-positive `batch_size`, `max_iter`, `queue_size` or `max_labeled`. `RuntimeError` when the seeds do not hold both classes, also when labeling resumes from a checkpoint file. `ValueError` when the checkpoint file holds feature vectors of another length, which happens when it is left from another run, when on the local engine the feature vectors of the pool are missing or differ in length, when an Arrow dataset given as `fvs` has more than 10,000,000 pairs, or when the labeler returns a value that is not one of [the contract](#the-contract). `FileNotFoundError` or `PermissionError`, before any pair is labeled, when a local `checkpoint_path` cannot be written.
 
 **Example:**
 
@@ -605,7 +608,7 @@ model = iris.SKLearnModel(XGBClassifier, nan_fill=0.0)
 labeled = iris.label_al(model, 'batch', labeler, pool, seeds, batch_size=10, max_iter=50)
 ```
 
-### label_pairs()
+### `label_pairs()`
 
 ```python
 def label_pairs(labeler: Labeler, pairs)
@@ -615,15 +618,15 @@ Asks the labeler about each pair of a given set, in order, without active learni
 
 **Parameters:**
 
-- `pairs`: a frame whose first two columns are the ids of table A and table B. An Arrow table or dataset is read into pandas, since the pairs a person labels are few.
+- `pairs`: a frame with the columns `id1` and `id2`, or, when it has no such columns, whose first two columns are the ids of table A and table B. An Arrow table or dataset is read a batch at a time.
 
-**Returns:** the pairs with the column `label`. A pair labeled unsure has the label 2.0. A stop label ends the labeling, and the result holds the labels collected before it.
+**Returns:** the pairs with the column `label`, as a pandas DataFrame for pandas or Arrow pairs. A pair labeled unsure has the label 2.0. A stop label ends the labeling, and the result holds the labels collected before it.
 
-**Raises:** `TypeError` for another kind of input.
+**Raises:** `TypeError` for another kind of input. `ValueError` when the labeler returns a value that is not one of [the contract](#the-contract).
 
 ### Checkpoints and resuming
 
-`create_seeds` and `label_al` write each label to `checkpoint_path` as it is collected. When the file exists at the start of a call, labeling resumes from the labels in it: `create_seeds` returns them as its seeds, and `label_al` continues from them. A session that was interrupted, by the labeler stopping, by an error, or by the machine shutting down, therefore continues where it stopped when it is run again with the same file. The default file, `active-matcher-training-data.parquet`, is in the current directory, so two runs in the same directory share it unless one of them names another file. A file whose feature vectors have another length than the run's is refused, since it comes from another dataset or another set of features.
+`create_seeds` and `label_al` write the labels to `checkpoint_path` while they collect them. `create_seeds` writes the labels it holds whenever the time since its last write is at least as long as that write took. A person labels seconds apart and a write takes milliseconds, so each label a person gives is written before the next pair is shown. The labels of a faster labeler, such as `GoldLabeler`, are written in groups, so that writing takes no longer than labeling, and a run that is killed loses at most the labels collected during one write. `label_al` writes the labels of each round when the round ends in batch mode, and the labels collected since the last training each time it retrains the matcher in continuous mode. Before the first label, both functions check that a local `checkpoint_path` can be written. When the file exists at the start of a call, labeling resumes from the labels in it. `create_seeds` keeps them as its first seeds, and `label_al` continues from them. A session that was interrupted, by the labeler stopping, by an error, or by the machine shutting down, therefore continues where it stopped when it is run again with the same file. The default file, `active-matcher-training-data.parquet`, is in the current directory, so two runs in the same directory share it unless one of them names another file. A file whose feature vectors have another length than the run's is refused, since it comes from another dataset or another set of features.
 
 ## Labelers
 
@@ -636,11 +639,13 @@ A labeler is called with the ids of a pair, `labeler(id1, id2)`, and returns one
 | 1.0 | A match. |
 | 0.0 | A non-match. |
 | 2.0 | Unsure. The pair is set aside and not asked again. |
-| −1.0 | Stop. Labeling ends with the labels collected so far. |
+| -1.0 | Stop. Labeling ends with the labels collected so far. |
 
-A labeler that shows records, namely `CLILabeler`, `WebUILabeler` and `CustomLabeler`, looks each record up by its id in the tables it was given. It does not load the tables into memory beyond what they already occupy. For an Arrow dataset, it reads the `_id` column once and then the row group that holds each record. For a Spark DataFrame of at most 100,000 rows, it collects the table to the driver once. For a larger one, it looks each record up with a small Spark job.
+Any other value, such as 0.5, `NaN` or text, stops the call with an error that names the labeler, the pair and the value.
 
-### GoldLabeler and DelayedGoldLabeler
+A labeler that shows records, namely `CLILabeler`, `WebUILabeler` and `CustomLabeler`, looks each record up by its id in the tables it was given. It does not load the tables into memory beyond what they already occupy. For an Arrow dataset of Parquet files, it reads the `_id` column once and then the row group that holds each record. For a dataset that is partitioned or filtered with `Dataset.filter`, it takes each record through Arrow, which applies the filter. For a Spark DataFrame of at most 100,000 rows, it collects the table to the driver once. For a larger one, it looks each record up with a small Spark job.
+
+### `GoldLabeler` and `DelayedGoldLabeler`
 
 ```python
 GoldLabeler(gold, symmetric: bool = False)
@@ -649,9 +654,9 @@ DelayedGoldLabeler(gold, delay_secs, symmetric: bool = False)
 
 `GoldLabeler` labels a pair 1.0 when it is in the gold set and 0.0 otherwise. With `symmetric=True`, the pair (y, x) is labeled as (x, y), which a deduplication needs when the gold set lists each pair in one order. `DelayedGoldLabeler` waits `delay_secs` seconds before each label, to simulate a person's pace.
 
-**Raises:** `TypeError` when the ids of the gold set and of the pairs asked about have different types, since every pair would be labeled 0.0.
+**Raises:** `TypeError` when the ids of the gold set and of the pairs asked about have different types, since every pair would be labeled 0.0. `ValueError` when the gold set holds integer ids that are null.
 
-### CLILabeler
+### `CLILabeler`
 
 ```python
 CLILabeler(a_df, b_df, id_col: str = '_id')
@@ -659,7 +664,7 @@ CLILabeler(a_df, b_df, id_col: str = '_id')
 
 Shows each pair at the terminal, as a table of the two records side by side, and reads the label typed: `y` for a match, `n` for a non-match, `u` for unsure, `h` to select the columns shown, and `s` to stop, after a confirmation. Part 3 of the tutorial shows its screen.
 
-### WebUILabeler
+### `WebUILabeler`
 
 ```python
 WebUILabeler(a_df, b_df, id_col: str = '_id', flask_port: int = 5005,
@@ -670,7 +675,7 @@ Shows each pair on a page in a browser, with buttons for match, non-match, unsur
 
 **Raises:** `ImportError` when the browser labeling support is not installed. `RuntimeError` when a port is in use or the page does not start.
 
-### CustomLabeler
+### `CustomLabeler`
 
 ```python
 class MyLabeler(iris.CustomLabeler):
@@ -682,7 +687,7 @@ A subclass of `CustomLabeler` labels with its own code. `label_pair` receives th
 
 ## Matchers
 
-### SKLearnModel and SparkMLModel
+### `SKLearnModel` and `SparkMLModel`
 
 ```python
 SKLearnModel(model, nan_fill=None, use_floats=True, **model_args)
@@ -693,12 +698,12 @@ SparkMLModel(model, nan_fill=0.0, **model_args)
 
 **Parameters:**
 
-- `model`: the classifier class, not an instance.
+- `model`: the classifier class, or an instance of it, whose parameters are then used.
 - `nan_fill`: the value that replaces a missing value in a feature vector before training and prediction. `None` leaves missing values in place, which XGBoost accepts and a random forest of scikit-learn does not.
 - `use_floats`: builds the feature matrix in float32, which halves its memory.
 - `model_args`: the arguments of the classifier, such as `max_depth=6, seed=42`.
 
-### train_matcher()
+### `train_matcher()`
 
 ```python
 def train_matcher(model: MLModel, labeled_data, feature_col='feature_vectors', label_col='label')
@@ -714,9 +719,9 @@ This function:
 
 **Returns:** the trained model.
 
-**Raises:** `ValueError` when the label column holds other values, or only one class.
+**Raises:** `ValueError` when the label column holds other values, or only one class. `TypeError` for labeled data that is neither a pandas nor a Spark DataFrame.
 
-### apply_matcher()
+### `apply_matcher()`
 
 ```python
 def apply_matcher(model: MLModel, df, feature_col: str, prediction_col: str, confidence_col: str = None)
@@ -729,11 +734,11 @@ Applies a trained matcher to every feature vector. Runs on either engine.
 - `df`: the feature vectors, as `featurize` returned them.
 - `prediction_col` and `confidence_col`: the names of the two columns added, conventionally `'prediction'` and `'confidence'`. Without `confidence_col`, only the prediction is added.
 
-**Returns:** the rows of `df` with the prediction, 1.0 or 0.0, and its confidence. For an Arrow dataset, worker processes write the predictions to scratch files, which are returned as an Arrow dataset.
+**Returns:** the rows of `df` with the prediction, 1.0 or 0.0, and its confidence. For pandas, a new DataFrame, and the DataFrame given is left unchanged. For an Arrow dataset, worker processes write the predictions to scratch files, which are returned as an Arrow dataset.
 
-**Raises:** `RuntimeError` when the model has not been trained. `TypeError` when a `SparkMLModel` is applied on the local engine.
+**Raises:** `RuntimeError` when the model has not been trained. `TypeError` when a `SparkMLModel` is applied to an Arrow dataset. `ValueError`, for an Arrow dataset, when its feature vectors have another number of values than those the matcher was trained on, or are missing or differ in length.
 
-### evaluate()
+### `evaluate()`
 
 ```python
 def evaluate(predictions, gold, threshold: float = 0.5, dedup: bool = False) -> dict
@@ -743,7 +748,9 @@ Compares the predictions with a gold set. Runs on either engine.
 
 **Parameters:**
 
-- `threshold`: a pair is a predicted match when its probability of being a match is at or above it. At 0.5 it agrees with the column `prediction`.
+- `predictions`: the result of `apply_matcher`, with each pair once.
+- `gold`: the gold pairs, with integer ids or ids that are whole numbers. With Spark predictions, the gold pairs may be a Spark DataFrame, a pandas DataFrame, or an Arrow table or dataset.
+- `threshold`: a pair is a predicted match when its probability of being a match is at or above it, a number from 0 to 1. At 0.5 it agrees with the column `prediction`.
 - `dedup`: counts (x, y) and (y, x) as one pair, by orienting the gold pairs so that `id1` is the smaller id. The predictions must be oriented the same way, as `featurize` orients the pairs of a deduplication.
 
 **Returns:** a dictionary with the following keys.
@@ -753,8 +760,10 @@ Compares the predictions with a gold set. Runs on either engine.
 | `n_gold`, `n_predicted` | The numbers of gold pairs and of predicted matches. |
 | `tp`, `fp`, `fn` | The true positives, false positives and false negatives. |
 | `precision`, `recall`, `f1` | At `threshold`. Recall is measured against the whole gold set. |
-| `threshold_curve` | One entry per threshold from 1.0 down to 0.0 in steps of 0.05, with `threshold`, `predicted`, `precision`, `recall` and `f1`. |
+| `threshold_curve` | One entry per threshold from 1.0 down to 0.0 in steps of 0.05 at which at least one pair is predicted a match, with `threshold`, `predicted`, `precision`, `recall` and `f1`. |
 | `best_threshold`, `best_f1` | The point of the curve with the best F1. |
+
+**Raises:** `ValueError` when `threshold` is not a number from 0 to 1, when a gold id is null or not a whole number, or, on the local engine, when the predictions list a pair more than once. `TypeError` when Spark predictions are given gold pairs of another kind.
 
 **Example:**
 
@@ -772,9 +781,9 @@ from iris.resources import build_session, plan
 spark = build_session(plan())
 ```
 
-`plan(master=None, driver_memory=None)` reads the memory and the cores of the machine, or of its container, and plans Spark's local mode, `local[n]` with `n` the number of parallel tasks the memory and the cores allow, and the driver's memory. `build_session(plan_, app_name='iris', shuffle_partitions=2000)` starts the session with Arrow enabled. On a cluster, the session comes from `spark-submit`, and the script takes it with `SparkSession.builder.getOrCreate()`, as Part 8 of the tutorial shows.
+`plan(master=None, driver_memory=None)` reads the memory and the cores of the machine, or of its container, or `IRIS_MEMORY_GB` when it is lower, and plans Spark's local mode, `local[n, 4]` with `n` the number of parallel tasks the memory and the cores allow and up to 4 attempts at each task, and the driver's memory. It logs a warning when that memory is smaller than the smallest session it can plan. `build_session(plan_, app_name='iris', shuffle_partitions=2000)` starts the session with Arrow enabled, and gives a local master without retries, such as `local[2]`, the same 4 attempts. Spark's local mode otherwise retries no task, so one transient failure, such as macOS refusing a socket write with `No buffer space available`, ends the run. `create_features` and `featurize` log a warning, once per session, when they run in a local session that retries no task. On a cluster, the session comes from `spark-submit`, and the script takes it with `SparkSession.builder.getOrCreate()`, as Part 8 of the tutorial shows.
 
-On Spark, the paths given to `read_table`, `read_pairs`, `featurize`, `save_data`, `load_data`, `checkpoint_path` and `save_features` may be URIs of storage that every machine of the cluster can read and write, such as `s3a://` or `hdfs://`. The files that Iris writes itself, namely the checkpoint, the description of the feature vectors and the saved features, are written through the Spark session, with the Hadoop library for the storage of the URI, so the machines of a cluster need no shared file system. [How to install Iris on a Spark cluster](installation/install-spark-cluster.md) describes the Hadoop library for each kind of storage.
+On Spark, the paths given to `read_table`, `read_pairs`, `featurize`, `save_data`, `save_predictions`, `load_data`, `save_features` and `load_features`, and the `checkpoint_path` of `create_seeds` and `label_al`, may be URIs of storage that every machine of the cluster can read and write, such as `s3a://` or `hdfs://`. The files that Iris writes itself, namely the checkpoint, the description of the feature vectors and the saved features, are written through the Spark session, with the Hadoop library for the storage of the URI. [How to install Iris on a Spark cluster](installation/install-spark-cluster.md) describes the Hadoop library for each kind of storage.
 
 ## Options for large runs
 
@@ -787,19 +796,21 @@ The functions are the same at every size. What changes is how the data is read a
 | Keep the tables and the candidate set on disk | Read them with `read_table` and `read_pairs` and `df_type='arrow'`, instead of pandas. |
 | Keep the feature vectors on disk | Pass `out` to `featurize`. With pandas tables, the feature vectors are brought into memory, up to `IRIS_MAX_DRIVER_ROWS` pairs. |
 | Put the scratch files on a larger disk | Set `IRIS_SPILL_DIR`, or call `iris.configure(spill_dir=...)`. By default they go to the system's temporary directory. |
-| Use fewer worker processes, for example when workers run out of memory | Set `IRIS_WORKERS`, or call `iris.configure(workers=...)`. By default it is up to one per core, and fewer when the memory is short, as `iris info` shows. |
+| Use fewer worker processes | Set `IRIS_WORKERS`, or call `iris.configure(workers=...)`. By default the local engine runs up to one per core, and starts each task only when the memory its tasks are measured to use is free. |
+| Share the machine with other programs | Set `IRIS_MEMORY_GB`, or call `iris.configure(memory_gb=...)`, to the memory Iris may use. By default it is the machine's memory, or the limit of its container or Slurm job, as `iris info` shows. |
 | Keep each labeler lookup small | Write the tables with row groups of about 65,536 rows. |
 
-The local engine checks the free disk space before it writes, and stops with an error that names the space it needs. The memory of a run is the pool, the labels, and one part of pairs per worker process, not the candidate set or its feature vectors.
+The local engine checks the free disk space before each step and each part of it, counting the parts the step keeps on disk at the same time, and stops with an error that names the space it needs. Parts that Parquet compresses, such as the feature vectors, are checked at the bytes their first part takes. On a volume with little room, that first part is written alone before the others start. When the data needs more space than the step estimated and the disk fills while it runs, the step stops with an error that names the directory and its estimate, and removes its scratch files. A run that was killed leaves its scratch directories and files behind. The next run on the same machine removes them once their process has ended and they have not changed for an hour. The memory of a run is the pool, the labels, and one part of pairs per worker process, not the candidate set or its feature vectors. The local engine measures the memory each task uses, and starts a task only when that memory is free beside the tasks that run. When the processes of a run hold more than its memory limit, it stops an idle worker process, or else the task it started last, which it runs again with fewer tasks at once, so the run slows down instead of failing.
 
 ### On a Spark cluster
 
 | Need | Option |
 | --- | --- |
 | Room for the shuffle of `featurize` | Scratch disk on every worker, `SPARK_LOCAL_DIRS` or `spark.local.dir`. `featurize` logs the size of the shuffle and stops with an error when a worker's scratch disk is too small. |
-| Memory for each task | `spark.executor.memory`. Each task holds a batch of records. When the records are large, `featurize` lowers `spark.sql.execution.arrow.maxRecordsPerBatch`, the number of rows Spark passes to Python at a time, in a session that Iris started with `build_session`. In a session from `spark-submit`, it logs a warning that names the value to set. |
-| Results that stay distributed | Write to URIs with `out` and `save_data`. A step that would collect more rows to the driver than `IRIS_MAX_DRIVER_ROWS` stops with an error. |
-| Feature vectors computed once | Pass `out` to `featurize`. Without it, the feature vectors are computed again by each step that uses them. |
+| Memory for each task | `spark.executor.memory`. Each task holds one batch of rows at a time. Before each stage that runs Python, in any session, Iris sets three settings from the bytes of the stage's rows, so that a batch holds about 1 MiB. They are `spark.sql.execution.arrow.maxRecordsPerBatch`, the number of rows Spark passes to Python at a time, `spark.sql.inMemoryColumnarStorage.batchSize`, the rows of a batch of a persisted table, and `spark.sql.parquet.columnarReaderBatchSize`, the rows the Parquet reader decodes at a time. For a Parquet input, Iris reads the bytes of a row from the files' footers before it reads the files. It keeps a smaller value that the session already has, and puts the three settings back when the stage ends. The stages of a lazy result, from `featurize` without `out` or from `apply_matcher`, run when the result is used, so for those Iris lowers `spark.sql.execution.arrow.maxRecordsPerBatch` and leaves it lowered. |
+| Row groups that fit | A task reads a whole Parquet row group of the columns it needs into the heap, and needs about twice its bytes. `create_features` and `featurize` read the sizes of the row groups from the files' footers first, and stop with an error that names the file when the largest, read at once by the tasks of one JVM, would not fit its heap. Rewrite such a file with smaller row groups, or raise `spark.executor.memory` (`spark.driver.memory` in local mode). |
+| Results that stay distributed | Write to URIs with `out` and `save_data`. A step that would collect more rows to the driver than `IRIS_MAX_DRIVER_ROWS`, or more bytes than the driver's memory holds, stops with an error before it collects. `load_data` and `save_data` with a path that has no scheme on a cluster go through the driver, and are checked the same way. |
+| Feature vectors computed once | Pass `out` to `featurize`. Without it, the feature vectors are computed again by each step that uses them, and the packed records stay persisted until the next `featurize` or the session's end. |
 | A quiet terminal | `--conf spark.log.level=WARN` on the `spark-submit` command line. |
 
 ## Settings and the command line
@@ -808,13 +819,14 @@ The local engine checks the free disk space before it writes, and stops with an 
 
 | Setting | Default | What it does |
 | --- | --- | --- |
-| `IRIS_WORKERS` | up to one per core | The number of worker processes of the local engine. |
+| `IRIS_WORKERS` | one per core | The most worker processes the local engine runs at once. It runs fewer when the memory they are measured to use needs it. |
+| `IRIS_MEMORY_GB` | the memory of the machine, its container or its job | The most memory, in GiB, the local engine plans to use, and the memory `iris.resources.plan` sizes a Spark session on one machine to. It can only lower the memory of the machine, its container or its job. |
 | `IRIS_SPILL_DIR` | the system's temporary directory | Where the local engine writes its scratch files. |
 | `IRIS_MAX_DRIVER_ROWS` | 20,000,000 | The most rows a step brings into the memory of the driver, or of this process with pandas. |
 
-A setting is an environment variable. `iris.configure(workers=4)` sets `IRIS_WORKERS` from Python, and `iris.load_env(path='.env')` reads the settings from a file of `NAME=value` lines. The file `.env.example` lists them.
+A setting is an environment variable. `iris.configure(workers=4)` sets `IRIS_WORKERS` from Python, and `iris.load_env(path='.env')` reads the settings from a file of `NAME=value` lines. Importing `iris` reads the file `.env` of the current directory, when there is one, and a variable already set in the environment keeps its value. The file `.env.example` lists the settings.
 
-### iris info and iris smoke
+### `iris info` and `iris smoke`
 
 `iris info` prints the versions of Iris and Python, the memory and the cores Iris sees, the number of worker processes and the scratch directory of the local engine, and whether PySpark and Java are present. `iris smoke` runs a short test on the local engine, which featurizes 64 pairs of two small built-in tables and trains and applies a matcher. `iris smoke --engine spark` runs it on Spark. The installer runs `iris smoke`.
 
@@ -828,6 +840,6 @@ The base classes are public, for code of your own.
 | `MLModel` | Use a classifier that is neither of scikit-learn's interface nor of Spark ML. |
 | `Feature` | Compare two columns in a new way. |
 | `Tokenizer` | Break text into tokens in a new way, for use in `create_features`. |
-| `Vectorizer` | Weigh tokens in a new way, for features such as TF/IDF. |
+| `Vectorizer` | Weight tokens in a new way, for features such as TF/IDF. |
 
 A subclass of `Feature`, `Tokenizer` or `Vectorizer` is used by the record store and the vocabulary, and must implement the methods of its base class that they call. The classes of `iris._core.feature` and `iris._core.tokenizer` are the examples to follow.

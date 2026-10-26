@@ -48,7 +48,7 @@ fi
 
 echo '[3/6] checking Java'
 if [ "$SPARK" = 0 ]; then
-    echo '      skipped: the local engine needs no Java (bash install.sh --spark adds Spark)'
+    echo '      skipped: Java is checked by bash install.sh --spark, which adds Spark support'
 else
 JAVA_BIN="java"
 if ! command -v java >/dev/null 2>&1; then

@@ -21,6 +21,10 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
+STACK_ROWS = 10_000
+
+STACK_BYTES = 4 * 2**20
+
 
 def _spark():
     from .._spark import ml_model
@@ -187,7 +191,6 @@ class SKLearnModel(MLModel):
                 self._model = model
         self._nan_fill = nan_fill
         self._use_floats = use_floats
-        self._vector_buffer = None
 
     @staticmethod
     def _capture_params(model, model_args):
@@ -197,11 +200,6 @@ class SKLearnModel(MLModel):
             params = {}
         params.update(model_args)
         return params
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        state['_vector_buffer'] = None
-        return state
 
     def params_dict(self):
         """Return the classifier's parameters as a dictionary."""
@@ -241,20 +239,17 @@ class SKLearnModel(MLModel):
         """Return a new, untrained classifier with the configured arguments."""
         return self._model(**self._model_args)
 
-    def _allocate_buffer(self, nrows, ncols):
-        needed_size = nrows * ncols
-        if self._vector_buffer is None or self._vector_buffer.size < needed_size:
-            self._vector_buffer = np.empty(needed_size, dtype=(np.float32 if self.use_floats else np.float64) )
-
-        return self._vector_buffer[:needed_size].reshape(nrows, ncols)
-
     def _make_feature_matrix(self, vecs):
         if len(vecs) == 0:
             return None
-        buffer = self._allocate_buffer(len(vecs), len(vecs[0]))
-        X = np.stack(vecs, axis=0, out=buffer)
-        if self._nan_fill is not None:
-            np.nan_to_num(X, copy=False, nan=self._nan_fill)
+        n, width = len(vecs), len(vecs[0])
+        X = np.empty((n, width), dtype=np.float32 if self.use_floats else np.float64)
+        step = max(1, min(STACK_ROWS, STACK_BYTES // max(8 * width, 1)))
+        for lo in range(0, n, step):
+            part = X[lo:lo + step]
+            np.stack(vecs[lo:lo + step], axis=0, out=part)
+            if self._nan_fill is not None:
+                np.nan_to_num(part, copy=False, nan=self._nan_fill)
         return X
 
     def _predict(self, vec_itr : Iterator[pd.Series]) -> Iterator[pd.Series]:
@@ -373,8 +368,7 @@ class SKLearnModel(MLModel):
     def train(self, df, vector_col : str, label_column : str):
         """Train the classifier on the feature vectors and labels of `df`."""
         if is_spark(df):
-            df = convert_to_array(df, vector_col)
-            df = df.toPandas()
+            df = _spark().collect_labeled(df, vector_col, label_column)
         X = self._make_feature_matrix(df[vector_col].values)
         y = df[label_column].values
         self._trained_model = self._model(**self._model_args)
@@ -388,7 +382,7 @@ class SKLearnModel(MLModel):
         vectors of `df`."""
         df = convert_to_array(df, vector_col)
         if is_spark(df):
-            df = df.toPandas()
+            df = _spark().collect_labeled(df, vector_col, label_column)
         X = self._make_feature_matrix(df[vector_col].values)
         y = df[label_column].values
 

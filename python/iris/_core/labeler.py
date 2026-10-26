@@ -16,7 +16,7 @@ import logging
 import tempfile
 import subprocess
 
-from .frames import is_spark
+from .frames import has_filter, is_spark
 from .utils import get_logger
 
 log = get_logger(__name__)
@@ -33,6 +33,24 @@ def _import_tabulate():
     except ImportError as e:
         raise ImportError(_WEB_EXTRA_MSG.format(dep="tabulate")) from e
     return tabulate
+
+
+LABELS = (1.0, 0.0, 2.0, -1.0)
+
+
+def label_of(labeler, id1, id2):
+    """Return the label `labeler` gives the pair `(id1, id2)`, checked to be 1.0, 0.0,
+    2.0 or -1.0."""
+    value = labeler(id1, id2)
+    try:
+        label = float(value)
+    except (TypeError, ValueError):
+        label = None
+    if label not in LABELS:
+        raise ValueError(f'{type(labeler).__name__} gave {value!r} as the label of '
+                         f'({id1}, {id2}); a label is 1.0 (match), 0.0 (non-match), 2.0 '
+                         f'(unsure) or -1.0 (stop)')
+    return label
 
 
 class Labeler(ABC):
@@ -100,6 +118,9 @@ def _finder(df, id_col):
     if isinstance(df, pa.Table):
         ids = df.column(id_col).to_numpy()
         read = lambda pos: df.slice(pos, 1).to_pylist()[0]
+    elif has_filter(df) or getattr(df, 'partitioning', None) is not None:
+        ids = df.to_table(columns=[id_col]).column(id_col).to_numpy()
+        read = lambda pos: df.take([pos]).to_pylist()[0]
     else:
         ids = df.to_table(columns=[id_col]).column(id_col).to_numpy()
         groups = [(f, g, pq.ParquetFile(f).metadata.row_group(g).num_rows)
@@ -122,6 +143,22 @@ def _finder(df, id_col):
     return find
 
 
+def _whole(a, b):
+    a, b = pd.Series(a).reset_index(drop=True), pd.Series(b).reset_index(drop=True)
+    if not (pd.api.types.is_float_dtype(a) or pd.api.types.is_float_dtype(b)):
+        return a, b
+    if not all(pd.api.types.is_numeric_dtype(x) and not pd.api.types.is_bool_dtype(x)
+               for x in (a, b)):
+        return a, b
+    va, vb = a.to_numpy(np.float64), b.to_numpy(np.float64)
+    known = ~(np.isnan(va) | np.isnan(vb))
+    va, vb = va[known], vb[known]
+    if not (np.all(va == np.floor(va)) and np.all(vb == np.floor(vb))
+            and np.all(np.abs(va) < 2**53) and np.all(np.abs(vb) < 2**53)):
+        return a, b
+    return pd.Series(va.astype(np.int64)), pd.Series(vb.astype(np.int64))
+
+
 class _GoldLookup:
     def __init__(self, gold, symmetric=False):
         if is_spark(gold):
@@ -132,7 +169,13 @@ class _GoldLookup:
         self._pairs_cache = None
 
         a, b = gold['id1'], gold['id2']
+        a, b = _whole(a, b)
         if len(a) and pd.api.types.is_integer_dtype(a) and pd.api.types.is_integer_dtype(b):
+            if a.hasnans or b.hasnans:
+                raise ValueError(f'GoldLabeler: the gold pairs contain null ids '
+                                 f'({int(a.isna().sum())} in id1, {int(b.isna().sum())} in '
+                                 f'id2); every gold pair names two records, so drop the pairs '
+                                 f'without an id')
             ai = np.asarray(a, dtype=np.int64)
             bi = np.asarray(b, dtype=np.int64)
             if symmetric:
@@ -241,8 +284,11 @@ class DelayedGoldLabeler(Labeler):
     person."""
     def __init__(self, gold, delay_secs, symmetric: bool = False):
         self._lookup = _GoldLookup(gold, symmetric)
-        self._gold = self._lookup._pairs
         self._delay_secs = delay_secs
+
+    @property
+    def _gold(self):
+        return self._lookup._pairs
 
     def __call__(self, id1, id2):
         time.sleep(self._delay_secs)

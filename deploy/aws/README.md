@@ -16,7 +16,7 @@ deploy/aws/status.sh
 deploy/aws/down.sh
 ```
 
-`account.sh` is run once. It creates a private bucket named `iris-ACCOUNT`, where ACCOUNT is the number of the AWS account, an instance role that gives the machines access to that bucket only, an SSH key pair, and a security group that admits all traffic between the machines of the cluster and SSH from your address. Running it again changes nothing that exists.
+`account.sh` is run once. It creates a private bucket named `iris-ACCOUNT`, where ACCOUNT is the number of the AWS account, an instance role that gives the machines access to that bucket only, an SSH key pair, and a security group that admits all traffic between the machines of the cluster and SSH from your address. Running it again changes nothing that exists, and admits SSH from your current address when it has changed since.
 
 `up.sh` uploads the committed code of the repository to the bucket, starts the machines, and waits until every worker has joined the master, which takes 5 to 10 minutes. It refuses to start when files under `python/` have uncommitted changes, because the cluster installs the committed code.
 

@@ -166,6 +166,11 @@ def _out_of_range(column, what, value):
 
 def _dates(arr, column):
     if pa.types.is_date64(arr.type):
+        ms = arr.cast(pa.int64()).to_numpy(zero_copy_only=False)
+        known = ~_null_mask(arr) if arr.null_count else np.ones(len(arr), dtype=bool)
+        if np.any(ms[known] % 86_400_000):
+            raise ValueError(f'column {column!r} is date64 with values that are not whole '
+                             f'days; store it as a timestamp, or as date32')
         arr = pc.cast(arr, pa.date32())
     days = arr.cast(pa.int32()).to_numpy(zero_copy_only=False)
     valid = ~_null_mask(arr) if arr.null_count else np.ones(len(arr), dtype=bool)
@@ -192,7 +197,11 @@ def _timestamps(arr, tz, column):
     raw = arr.cast(pa.int64()).to_numpy(zero_copy_only=False)
     valid = ~_null_mask(arr) if arr.null_count else np.ones(len(arr), dtype=bool)
     raw = np.where(valid, raw, 0)
-    micros = raw * (1_000_000 // _PER_SECOND[unit]) if unit != 'ns' else raw // 1_000
+    factor = 1_000_000 // _PER_SECOND[unit] if unit != 'ns' else 1
+    if factor > 1 and np.any(np.abs(raw) > np.iinfo(np.int64).max // factor):
+        bad = raw[np.abs(raw) > np.iinfo(np.int64).max // factor][0]
+        raise _out_of_range(column, 'a timestamp of', f'{int(bad)} {unit} from 1970')
+    micros = raw * factor if unit != 'ns' else raw // 1_000
     zone = ZoneInfo(tz) if arr.type.tz is not None else None
     uniq, inverse = np.unique(micros, return_inverse=True)
     texts = []
@@ -229,10 +238,14 @@ def to_text(arr, tz, column=None):
         return to_text(arr.dictionary_decode(), tz, column)
     if pa.types.is_null(t):
         return pa.nulls(len(arr), type=pa.string())
-    if pa.types.is_string(t):
-        return arr
-    if pa.types.is_large_string(t):
-        return arr.cast(pa.string())
+    if pa.types.is_string(t) or pa.types.is_large_string(t):
+        try:
+            arr.validate(full=True)
+        except pa.ArrowInvalid as e:
+            raise ValueError(f'column {column!r} holds text that is not valid UTF-8 ({e}); '
+                             f'decode it, or replace the bad bytes, before Iris reads it') \
+                from None
+        return arr if pa.types.is_string(t) else arr.cast(pa.string())
     if pa.types.is_boolean(t) or pa.types.is_integer(t):
         return pc.cast(arr, pa.string())
     if pa.types.is_float32(t) or pa.types.is_float64(t):

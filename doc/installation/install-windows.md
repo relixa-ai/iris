@@ -1,10 +1,10 @@
 ## How to install Iris on Windows
 
-This guide installs Iris on a Windows machine. With Option B below, Iris runs on its local engine only, without Spark or Java, and Parts 1 to 6 of the [tutorial](../tutorial.md) run. With Option A, Iris runs in Ubuntu under Windows as on a Linux machine, and with Spark support all eight parts run.
+This guide installs Iris on a Windows machine. With Option B below, Iris runs on its local engine only, and Parts 1 to 6 of the [tutorial](../tutorial.md) run. With Option A, Iris runs in Ubuntu under Windows as on a Linux machine, and with Spark support all eight parts run.
 
 There are two ways to install Iris on Windows. The first runs Iris in Ubuntu under the Windows Subsystem for Linux (WSL), and follows the [Linux guide](install-linux.md), which has been tested on Ubuntu 24.04. The second installs Iris in Windows itself, with Python for Windows. **This guide has not yet been tested on Windows.** If a step fails, please open an issue with the full output of the step.
 
-The installation produces a Python environment, the `.venv` folder, inside the `iris` folder. Nothing is installed system-wide, and nothing outside the `iris` folder is modified, apart from the prerequisites in Step 1.
+The installation produces a Python environment, the `.venv` folder, inside the `iris` folder, once the prerequisites of Step 1 are installed.
 
 ---
 
@@ -24,7 +24,7 @@ Restart Windows when asked, open **Ubuntu** from the Start menu, and create a us
 
 ### Step 1: Check the prerequisites
 
-Iris needs Python 3.10, 3.11 or 3.12. Every dependency installs from a prebuilt package, so no compiler is needed. This option does not cover Spark support, which on Windows also needs Hadoop's Windows program `winutils.exe` and settings that this guide does not install. Use Option A for Spark.
+Iris needs Python 3.10, 3.11 or 3.12. Every dependency installs from a prebuilt package. This option does not cover Spark support, which on Windows also needs Hadoop's Windows program `winutils.exe` and settings that this guide does not install. Use Option A for Spark.
 
 #### Python
 
@@ -67,7 +67,7 @@ iris smoke
 These commands do the following.
 
 - **Create the folder `.venv`** inside the `iris` folder, which is a Python environment separate from the system's Python, and activate it in this PowerShell window.
-- **Install Iris and its dependencies** into `.venv` with `pip`, from the Python Package Index ([pypi.org](https://pypi.org)), at the versions listed in `constraints.txt`. The dependencies are NumPy, pandas, PyArrow, SciPy, scikit-learn, XGBoost, Numba, mmh3, py_stringmatching, joblib, threadpoolctl and tqdm, each a prebuilt package. This takes a few minutes.
+- **Install Iris and its dependencies** into `.venv` with `pip`, from the Python Package Index ([pypi.org](https://pypi.org)), at the versions listed in `constraints.txt`. The dependencies are NumPy, pandas, PyArrow, SciPy, scikit-learn, XGBoost, Numba, mmh3, `py_stringmatching`, joblib, threadpoolctl and tqdm, each a prebuilt package. This takes a few minutes.
 - **Run a short test**, `iris smoke`, which creates the features of two small built-in tables, featurizes their 64 pairs, and trains and applies a matcher. It ends with `OK: iris works on this machine.`
 
 Then run the first part of the tutorial:

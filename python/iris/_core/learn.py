@@ -10,7 +10,8 @@ import time
 import numpy as np
 import pandas as pd
 
-from .labeler import Labeler, WebUILabeler
+from .labeler import (DelayedGoldLabeler, GoldLabeler, Labeler, WebUILabeler,
+                      label_of)
 from .ml_model import MLModel, normalize_fv_cells
 from .utils import (check_driver_collect, check_training_data_matches,
                     feature_vector_width, get_logger, load_training_data_streaming,
@@ -78,7 +79,7 @@ class BatchLearner:
             'Lower max_iter or batch_size so active learning selects a subset.',
         )
         batch = pool.everything()
-        batch['label'] = batch[['id1', 'id2']].apply(lambda x: float(self._labeler(*x.values)), axis=1)
+        batch['label'] = batch[['id1', 'id2']].apply(lambda x: label_of(self._labeler, *x.values), axis=1)
         batch['labeled_in_iteration'] = -2.0
         self.local_training_fvs_ = batch
         try:
@@ -121,17 +122,6 @@ class BatchLearner:
                 else:
                     log.info('the pool is no larger than the labels to collect: active learning will label every pair in it')
 
-            if existing_training_data is not None:
-                log.info('Training initial model with existing data')
-                normalize_fv_cells(self.local_training_fvs_, 'feature_vectors')
-                pool.train(self._model, self.local_training_fvs_)
-                log.info('Initial model training complete')
-            else:
-                self.local_training_fvs_ = seeds.copy()
-
-            self.local_training_fvs_['labeled_in_iteration'] = -1
-            normalize_fv_cells(self.local_training_fvs_, 'feature_vectors')
-
             total_pos, total_neg = self._get_pos_negative(self.local_training_fvs_)
             if total_pos == 0 or total_neg == 0:
                 raise RuntimeError(
@@ -143,6 +133,17 @@ class BatchLearner:
                     f'agreeing on empty or null fields. Raise nseeds, supply seeds '
                     f'directly, or use a score column that separates the classes.')
 
+            if existing_training_data is not None:
+                log.info('Training initial model with existing data')
+                normalize_fv_cells(self.local_training_fvs_, 'feature_vectors')
+                pool.train(self._model, self.local_training_fvs_)
+                log.info('Initial model training complete')
+            else:
+                self.local_training_fvs_ = seeds.copy()
+
+            self.local_training_fvs_['labeled_in_iteration'] = -1
+            normalize_fv_cells(self.local_training_fvs_, 'feature_vectors')
+
             log.info(f'max iter = {max_itr}')
             i = 0
             label = None
@@ -150,6 +151,9 @@ class BatchLearner:
                 log.warning("Records are almost ready to be labeled.")
 
             while i < max_itr and label != -1:
+                if n_fvs <= len(self.local_training_fvs_):
+                    log.info('all fvs labeled, terminating active learning')
+                    break
                 log.info(f'starting iteration {i}')
                 log.info('training model')
                 pool.train(self._model, self.local_training_fvs_)
@@ -164,7 +168,7 @@ class BatchLearner:
                 user_stopped = False
 
                 for idx, row in new_labeled_batch.iterrows():
-                    label = float(self._labeler(row['id1'], row['id2']))
+                    label = label_of(self._labeler, row['id1'], row['id2'])
                     if label == -1.0:
                         user_stopped = True
                         break
@@ -182,7 +186,8 @@ class BatchLearner:
                 total_pos += pos
                 total_neg += neg
 
-                save_training_data_streaming(new_labeled_batch, self._checkpoint_path, log)
+                if len(new_labeled_batch):
+                    save_training_data_streaming(new_labeled_batch, self._checkpoint_path, log)
 
                 self.local_training_fvs_ = pd.concat([self.local_training_fvs_, new_labeled_batch], ignore_index=True)
                 log.info(f'new batch positive = {pos} negative = {neg}, total positive = {total_pos} negative = {total_neg}')
@@ -257,7 +262,7 @@ class ContinuousLearner:
             'Lower max_labeled so active learning selects a subset.',
         )
         batch = pool.everything()
-        batch['label'] = batch[['id1', 'id2']].apply(lambda x: float(self._labeler(*x.values)), axis=1)
+        batch['label'] = batch[['id1', 'id2']].apply(lambda x: label_of(self._labeler, *x.values), axis=1)
         batch['labeled_in_iteration'] = -2.0
         self.local_training_fvs_ = batch
         try:
@@ -270,6 +275,12 @@ class ContinuousLearner:
     def train(self, fvs, seeds):
         """Run active learning from the seeds over the feature vectors and return the
         labeled pairs."""
+        if self._on_demand_stop and isinstance(self._labeler, (GoldLabeler,
+                                                               DelayedGoldLabeler)):
+            log.warning(f'max_labeled ({self._max_labeled}) is ignored while '
+                        f'on_demand_stop is True, and {type(self._labeler).__name__} never '
+                        f'stops on its own: labeling goes on until every pair of the pool '
+                        f'is labeled. Pass on_demand_stop=False to end at max_labeled.')
         pool = self._open_pool(fvs)
         to_be_label_queue = PriorityQueue(self._queue_size)
         labeled_queue = Queue(self._queue_size * 5)
@@ -327,7 +338,7 @@ class ContinuousLearner:
                         'label queue is empty and the training thread is not alive, '
                         'with no training data produced')
             else:
-                example['label'] = float(self._labeler(example['id1'], example['id2']))
+                example['label'] = label_of(self._labeler, example['id1'], example['id2'])
                 if example['label'] == -1.0:
                     log.info('user stopped labeling, terminating active learning')
                     terminate = True

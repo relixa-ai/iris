@@ -7,10 +7,8 @@ import pyarrow.compute as pc
 
 from .._core import feature_select
 from .._core.textform import resolve_timezone, to_text
-from . import inputs
+from . import disk, inputs
 from .procpool import run_tasks, workers_for
-
-WORKER_GB = 1.0
 
 
 def _kind(t):
@@ -42,16 +40,20 @@ def _null_counts(obj, cols, names, float_names, rows, nulls):
 
 def _count_chunk(task, tz, token_cols, flags):
     chunk, cols, names = task
-    table = inputs.read_chunk(chunk, cols)
-    counts = {}
-    for part in inputs.slices(table):
-        frame = pd.DataFrame({name: to_text(part.column(col), tz, col).to_pandas()
-                              for col, name in zip(cols, names)})
+    counts, longest = {}, {}
+    for part in inputs.read_slices(chunk, cols):
+        texts = {name: to_text(part.column(col), tz, col) for col, name in zip(cols, names)}
+        for name, text in texts.items():
+            n = pc.max(pc.utf8_length(text)).as_py()
+            if n is not None and n > longest.get(name, 0):
+                longest[name] = n
+        frame = pd.DataFrame({name: text.to_pandas() for name, text in texts.items()})
         feature_select.add_counts(counts, feature_select.chunk_counts(frame, token_cols,
                                                                       flags))
-    return counts
+    return counts, longest
 
 
+@disk.disk_step('create_features')
 def create_features(A, B, a_cols, b_cols, sim_functions=None, tokenizers=None,
                     null_threshold=.5, numeric_threshold=.9, min_doc_freq=1,
                     max_vocab_size=None, timezone=None, workers=None):
@@ -59,8 +61,12 @@ def create_features(A, B, a_cols, b_cols, sim_functions=None, tokenizers=None,
     `b_cols` of table B."""
     tokenizers = feature_select.default_tokenizers(tokenizers)
     feature_select.check_numeric_threshold(numeric_threshold)
+    feature_select.check_sim_functions(sim_functions)
     tz = resolve_timezone(timezone)
     a_cols, b_cols = list(a_cols), list(b_cols)
+    feature_select.check_columns(inputs.columns(A), a_cols, 'A')
+    if B is not None:
+        feature_select.check_columns(inputs.columns(B), b_cols, 'B')
     b_of = dict(zip(a_cols, b_cols))
     a_schema = inputs.schema(A)
     b_schema = None if B is None else inputs.schema(B)
@@ -83,17 +89,28 @@ def create_features(A, B, a_cols, b_cols, sim_functions=None, tokenizers=None,
     token_cols = feature_select.token_columns(kept, tokenizers)
 
     counts = {}
+    longest = ({}, {})
     if kept and (token_cols or flags):
+        workers = workers or workers_for()
+        b_kept = [b_of[k] for k in kept]
         with inputs.scratch() as tmp:
-            a = inputs.stage(A, tmp, 'a')
-            tasks = [(c, kept, kept) for c in inputs.chunks(a)]
+            a = inputs.stage(A, tmp, 'a', None if B is A else kept, workers)
+            tasks = [(c, kept, kept) for c in inputs.chunks(a, workers=workers)]
+            in_a = len(tasks)
             if B is not None:
-                b = a if B is A else inputs.stage(B, tmp, 'b')
-                tasks += [(c, [b_of[k] for k in kept], kept) for c in inputs.chunks(b)]
+                b = a if B is A else inputs.stage(B, tmp, 'b', b_kept, workers)
+                tasks += [(c, b_kept, kept) for c in inputs.chunks(b, workers=workers)]
             fn = partial(_count_chunk, tz=tz, token_cols=token_cols, flags=flags)
-            for part in run_tasks(fn, tasks, workers or workers_for(WORKER_GB)):
+            for k, (part, most) in enumerate(run_tasks(fn, tasks, workers,
+                                                       task_bytes=inputs.chunk_bytes())):
                 feature_select.add_counts(counts, part)
+                side = longest[0 if k < in_a else 1]
+                for name, n in most.items():
+                    side[name] = max(side.get(name, 0), n)
     numeric = feature_select.numeric_columns(kept, typed_numeric, counts, flags,
                                              numeric_threshold)
-    return feature_select.choose(kept, numeric, token_cols, counts, sim_functions,
-                                 min_doc_freq, max_vocab_size)
+    features = feature_select.choose(kept, numeric, token_cols, counts, sim_functions,
+                                     min_doc_freq, max_vocab_size)
+    feature_select.warn_long_alignments(features, longest[0],
+                                        longest[0] if B is None else longest[1])
+    return features

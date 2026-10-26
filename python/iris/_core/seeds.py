@@ -5,6 +5,8 @@ import logging
 
 import numpy as np
 
+from .labeler import label_of
+
 SCAN_MULTIPLIER = 50
 
 log = logging.getLogger(__name__)
@@ -13,6 +15,22 @@ log = logging.getLogger(__name__)
 def scan_size(nseeds, n_valid):
     """Return the number of rows examined from each end of the ranking."""
     return min(max(nseeds * SCAN_MULTIPLIER, nseeds), n_valid)
+
+
+def too_few_scores(nseeds, n_valid, n_rows, score_column):
+    """Return the error for asking for more seeds than the feature vectors have
+    scores."""
+    if not n_rows:
+        return ValueError('create_seeds was given no feature vectors, so there is no pair '
+                          'to draw seeds from')
+    if not n_valid:
+        return ValueError(f"every '{score_column}' of the {n_rows:,} feature vectors is "
+                          f'missing or NaN, and create_seeds draws seeds by that score; pass '
+                          f'the feature vectors as featurize gives them, with a score for '
+                          f'each pair, or name another column with score_column')
+    return ValueError(f'create_seeds was asked for {nseeds:,} seeds, and only {n_valid:,} '
+                      f"of the {n_rows:,} feature vectors have a '{score_column}' to draw "
+                      f'them by; ask for at most {n_valid:,} seeds')
 
 
 def rankings(id1, id2, score, nseeds):
@@ -54,7 +72,7 @@ def label_seeds(likely_matches, likely_non_matches, labeler, nseeds, labeled=(),
         pair = (int(row['id1']), int(row['id2']))
         if pair in seen:
             continue
-        label = float(labeler(row['id1'], row['id2']))
+        label = label_of(labeler, row['id1'], row['id2'])
         if label == -1.0:
             break
         if label == 2.0:

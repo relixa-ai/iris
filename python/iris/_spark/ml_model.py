@@ -12,6 +12,10 @@ from pyspark.sql import DataFrame as SparkDataFrame, SparkSession
 from pyspark.sql.types import DoubleType, StructField, StructType
 
 from .._core.ml_model import MLModel, convert_to_array, convert_to_vector
+from .._core.utils import check_driver_collect
+from .utils import lower_batches, vector_row_bytes, vector_width
+
+PANDAS_ROW_BYTES = 200
 
 _DOUBLE_ARRAY = T.ArrayType(T.DoubleType())
 _FLOAT_ARRAY = T.ArrayType(T.FloatType())
@@ -48,9 +52,29 @@ def to_array(df, col):
     return df
 
 
+def collect_labeled(df, vector_col, label_col):
+    """Return the feature vectors and labels of a Spark DataFrame as pandas, after checking
+    that the driver can hold them."""
+    df = to_array(df, vector_col).select(vector_col, label_col)
+    n = df.count()
+    width = vector_width(df, vector_col) or 0
+    check_driver_collect(
+        n, 'training a scikit-learn model on Spark feature vectors',
+        'Train on the labeled pairs only, or on fewer of them; a SparkMLModel trains '
+        'without collecting them.', row_bytes=vector_row_bytes(width) + PANDAS_ROW_BYTES)
+    return df.toPandas()
+
+
+def _bound_batches(model, df):
+    width = getattr(model.trained_model, 'n_features_in_', None)
+    if width:
+        lower_batches(df.sparkSession, vector_row_bytes(width))
+
+
 def predict(model, df, vector_col, output_col):
     """Return the Spark DataFrame with the predicted label of each row."""
     df = convert_to_array(df, vector_col)
+    _bound_batches(model, df)
     f = F.pandas_udf(model._predict, T.DoubleType())
     return df.withColumn(output_col, f(vector_col))
 
@@ -59,6 +83,7 @@ def predict_with_confidence(model, df, vector_col, prediction_col, confidence_co
     """Return the Spark DataFrame with the predicted label and its confidence of each
     row."""
     df = convert_to_array(df, vector_col)
+    _bound_batches(model, df)
     schema = StructType([
         StructField("prediction", DoubleType(), True),
         StructField("confidence", DoubleType(), True)
@@ -74,6 +99,7 @@ def predict_with_confidence(model, df, vector_col, prediction_col, confidence_co
 def prediction_conf(model, df, vector_col, output_col):
     """Return the Spark DataFrame with the confidence of the predicted label of each
     row."""
+    _bound_batches(model, df)
     f = F.pandas_udf(model._prediction_conf, T.DoubleType())
     return df.withColumn(output_col, f(vector_col))
 
@@ -81,6 +107,7 @@ def prediction_conf(model, df, vector_col, output_col):
 def entropy(model, df, vector_col, output_col):
     """Return the Spark DataFrame with the entropy of the predicted class probabilities
     of each row."""
+    _bound_batches(model, df)
     f = F.pandas_udf(model._entropy, T.DoubleType())
     return df.withColumn(output_col, f(vector_col))
 

@@ -11,12 +11,13 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .._core.utils import get_logger
-from . import inputs
+from . import disk, inputs
 from .procpool import atomic_output, run_tasks, workers_for
 
 PAIRS_PER_PART = 1 << 20
 
-WORKER_GB = 1.0
+SAMPLE_PAIRS = 1 << 20
+
 
 PAIR_SCHEMA = pa.schema([('id1', pa.int64()), ('id2', pa.int64())])
 
@@ -61,9 +62,7 @@ def count(cands):
                for b in inputs.arrow_batches(cands, ['id1_list']))
 
 
-def _route(task, flat, boundaries, out_dir, parts=None, drop_self=False, orient=False,
-           by='id2'):
-    c, chunk = task
+def _chunk_pairs(chunk, flat, drop_self, orient):
     id1, id2 = _pairs(inputs.read_chunk(chunk, ['id1', 'id2'] if flat else ['id2', 'id1_list']),
                       flat)
     if drop_self:
@@ -71,9 +70,57 @@ def _route(task, flat, boundaries, out_dir, parts=None, drop_self=False, orient=
         id1, id2 = id1[keep], id2[keep]
     if orient:
         id1, id2 = np.minimum(id1, id2), np.maximum(id1, id2)
-    key = id1 if by == 'id1' else id2
-    part = (np.searchsorted(boundaries, key, side='right') if boundaries is not None
-            else np.mod(key, parts))
+    return id1, id2
+
+
+def part_of(major, minor, bounds):
+    """Return the part of each pair: how many of the sorted `(major, minor)` boundaries
+    are at or below it."""
+    if not len(bounds):
+        return np.zeros(len(major), np.int64)
+    first, second = bounds[:, 0], bounds[:, 1]
+    lo = np.searchsorted(first, major, side='left')
+    hi = np.searchsorted(first, major, side='right')
+    part = lo.astype(np.int64)
+    tied = np.flatnonzero(hi > lo)
+    if len(tied):
+        for value in np.unique(major[tied]).tolist():
+            at = tied[major[tied] == value]
+            a, z = lo[at[0]], hi[at[0]]
+            part[at] = a + np.searchsorted(second[a:z], minor[at], side='right')
+    return part
+
+
+def _sample(task, flat, drop_self, orient, by):
+    chunk, every = task
+    id1, id2 = _chunk_pairs(chunk, flat, drop_self, orient)
+    pick = slice(0, None, every)
+    major, minor = (id1, id2) if by == 'id1' else (id2, id1)
+    return np.stack([major[pick], minor[pick]], axis=1)
+
+
+def boundaries(chunks, n, parts, workers, flat=True, drop_self=False, orient=False,
+               by='id2'):
+    """Return the `(major, minor)` keys that cut a sample of the pairs into `parts`
+    parts of about as many pairs each."""
+    if parts <= 1 or not chunks:
+        return np.empty((0, 2), np.int64)
+    every = max(1, n // SAMPLE_PAIRS)
+    found = run_tasks(partial(_sample, flat=flat, drop_self=drop_self, orient=orient, by=by),
+                      [(c, every) for c in chunks], workers,
+                      task_bytes=inputs.chunk_bytes())
+    sample = np.concatenate(found) if found else np.empty((0, 2), np.int64)
+    if not len(sample):
+        return np.empty((0, 2), np.int64)
+    sample = sample[np.lexsort((sample[:, 1], sample[:, 0]))]
+    return np.unique(sample[(np.arange(1, parts) * len(sample)) // parts], axis=0)
+
+
+def _route(task, flat, boundaries, out_dir, drop_self=False, orient=False, by='id2'):
+    c, chunk = task
+    id1, id2 = _chunk_pairs(chunk, flat, drop_self, orient)
+    major, minor = (id1, id2) if by == 'id1' else (id2, id1)
+    part = part_of(major, minor, boundaries)
     order = np.argsort(part, kind='stable')
     part, id1, id2 = part[order], id1[order], id2[order]
     cuts = np.r_[0, np.flatnonzero(np.diff(part)) + 1, len(part)]
@@ -105,27 +152,24 @@ def _sort(task, out_dir, by='id2'):
     return path, n_in, len(pairs)
 
 
-def canonical(cands, b_ids, directory, workers=None, one_table=False):
+def canonical(cands, directory, workers=None, one_table=False):
     """Write the candidates as distinct pairs in parts ordered by `(id2, id1)`, and
     return the parts, the repeats dropped and, for one table, the self-pairs dropped."""
-    workers = workers or workers_for(WORKER_GB)
+    workers = workers or workers_for()
     flat = is_flat(inputs.columns(cands))
     n = count(cands)
-    inputs.require_disk(32 * n, directory, 'the candidate pairs')
     parts = max(1, math.ceil(n / PAIRS_PER_PART))
-    cut_at = (np.arange(1, parts) * len(b_ids)) // parts
-    boundaries = np.unique(np.asarray(b_ids, np.int64)[cut_at]) if len(b_ids) \
-        else np.empty(0, np.int64)
     routed = os.path.join(directory, 'routed')
     os.makedirs(routed)
     with inputs.scratch() as tmp:
-        src = inputs.stage(cands, tmp, 'candidates')
-        kept = run_tasks(partial(_route, flat=flat, boundaries=boundaries, out_dir=routed,
+        src = inputs.stage(cands, tmp, 'candidates', workers=workers)
+        inputs.require_disk(16 * n, routed, 'the routed candidate pairs', kept=0)
+        chunks = inputs.chunks(src, workers=workers)
+        cuts = boundaries(chunks, n, parts, workers, flat, one_table, one_table)
+        kept = run_tasks(partial(_route, flat=flat, boundaries=cuts, out_dir=routed,
                                  drop_self=one_table, orient=one_table),
-                         list(enumerate(inputs.chunks(src))), workers)
-    tasks = [(k, os.path.join(routed, name))
-             for k, name in enumerate(sorted(os.listdir(routed)))]
-    out = run_tasks(partial(_sort, out_dir=directory), tasks, workers)
+                         list(enumerate(chunks)), workers, task_bytes=inputs.chunk_bytes())
+    tasks, out = _sorted(routed, directory, sum(kept), workers)
     for _, routed_part in tasks:
         for f in glob.glob(os.path.join(routed_part, '*.npy')):
             os.remove(f)
@@ -133,34 +177,51 @@ def canonical(cands, b_ids, directory, workers=None, one_table=False):
     return [(path, n_out) for path, _, n_out in out], repeats, n - sum(kept)
 
 
+def _sorted(routed, directory, total, workers, by='id2'):
+    tasks = [(k, os.path.join(routed, name))
+             for k, name in enumerate(sorted(os.listdir(routed)))]
+    meter = disk.Meter('the sorted candidate pairs', directory, total)
+    finished = {}
+
+    def done(k, result):
+        finished[os.path.basename(result[0])] = result[1]
+        meter.wrote(sum(finished.values()), *disk.written_in(directory, finished))
+    out = disk.measured(run_tasks, partial(_sort, out_dir=directory, by=by), tasks, workers,
+                        meter, 16 * total, done, task_bytes=16 * PAIRS_PER_PART)
+    return tasks, out
+
+
+@disk.disk_step('clean_candidates')
 def clean(cands, drop_self_pairs=False, canonicalize_mirrors=False, directory=None,
           workers=None):
     """Return the candidates as distinct flat pairs, without self-pairs and mirrored
     pairs when requested."""
     import tempfile
 
-    from .._core.storage import spill_dir
+    from .._core.storage import scratch_prefix, spill_dir
     from .featurize import _remove_at_exit
 
-    workers = workers or workers_for(WORKER_GB)
+    workers = workers or workers_for()
     if directory is None:
-        directory = tempfile.mkdtemp(prefix='iris-pairs-', dir=spill_dir())
+        directory = tempfile.mkdtemp(prefix=scratch_prefix('pairs'), dir=spill_dir())
         _remove_at_exit(directory)
+        disk.output(directory)
     os.makedirs(directory, exist_ok=True)
     flat = is_flat(inputs.columns(cands))
     n = count(cands)
-    inputs.require_disk(32 * n, directory, 'the candidate pairs')
     parts = max(1, math.ceil(n / PAIRS_PER_PART))
     routed = os.path.join(directory, 'routed')
     os.makedirs(routed)
     with inputs.scratch() as tmp:
-        src = inputs.stage(cands, tmp, 'candidates')
-        run_tasks(partial(_route, flat=flat, boundaries=None, out_dir=routed, parts=parts,
-                          drop_self=drop_self_pairs, orient=canonicalize_mirrors),
-                  list(enumerate(inputs.chunks(src))), workers)
-    tasks = [(k, os.path.join(routed, name))
-             for k, name in enumerate(sorted(os.listdir(routed)))]
-    out = run_tasks(partial(_sort, out_dir=directory), tasks, workers)
+        src = inputs.stage(cands, tmp, 'candidates', workers=workers)
+        inputs.require_disk(16 * n, routed, 'the routed candidate pairs', kept=0)
+        chunks = inputs.chunks(src, workers=workers)
+        cuts = boundaries(chunks, n, parts, workers, flat, drop_self_pairs,
+                          canonicalize_mirrors)
+        kept = run_tasks(partial(_route, flat=flat, boundaries=cuts, out_dir=routed,
+                                 drop_self=drop_self_pairs, orient=canonicalize_mirrors),
+                         list(enumerate(chunks)), workers, task_bytes=inputs.chunk_bytes())
+    _, out = _sorted(routed, directory, sum(kept), workers)
     import shutil
     shutil.rmtree(routed, ignore_errors=True)
     kept = sum(n_out for _, _, n_out in out)

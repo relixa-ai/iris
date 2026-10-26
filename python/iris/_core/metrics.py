@@ -1,6 +1,8 @@
 """Scoring predictions against gold pairs, shared by both engines."""
 from __future__ import annotations
 
+import math
+
 import numba as nb
 import numpy as np
 
@@ -25,6 +27,17 @@ def p_match(prediction, confidence):
     return np.where(prediction == 1.0, confidence, 1.0 - confidence)
 
 
+def check_threshold(threshold):
+    """Refuse a threshold that is not a probability from 0 to 1."""
+    try:
+        value = float(threshold)
+    except (TypeError, ValueError):
+        value = math.nan
+    if isinstance(threshold, (str, bytes)) or not 0.0 <= value <= 1.0:
+        raise ValueError(f'threshold must be from 0 to 1: it is the probability of a match '
+                         f'at or above which a pair is predicted to match; got {threshold!r}')
+
+
 def positives(prediction, confidence, threshold):
     """Return which rows are predicted matches at `threshold`."""
     if threshold == 0.5:
@@ -34,7 +47,8 @@ def positives(prediction, confidence, threshold):
 
 def bucket(p):
     """Return the threshold-sweep bucket, 0 to 100, of each probability."""
-    return np.minimum(np.floor(np.asarray(p, dtype=np.float64) * 100), 100).astype(np.int64)
+    p = np.nan_to_num(np.asarray(p, dtype=np.float64), nan=0.0, posinf=1.0, neginf=0.0)
+    return np.clip(np.floor(p * 100), 0, 100).astype(np.int64)
 
 
 def prf(tp, n_predicted, n_gold):

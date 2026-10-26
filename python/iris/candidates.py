@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 
+import numpy as np
 import pandas as pd
 
 
@@ -34,48 +35,46 @@ def candidates_from_flat(
     if len(pairs) == 0:
         return pd.DataFrame({"id2": [], **{c: [] for c in lists}})
 
-    df = pairs[[b_col, a_col] + ([score] if score else [])]
-    if sort_by_score and score:
-        df = df.sort_values([b_col, score], ascending=[True, False], kind="stable")
+    a = pairs[a_col].to_numpy()
+    b = pairs[b_col].to_numpy()
+    scores = pairs[score].to_numpy(np.float64) if score else None
+    if pd.isna(a).any() or pd.isna(b).any():
+        raise ValueError(f"candidates_from_flat: '{a_col}' and '{b_col}' must not hold "
+                         f"null ids")
+    order = (np.lexsort((-scores, b)) if sort_by_score and score
+             else np.arange(len(b)))
+    return _grouped(a[order], b[order], None if scores is None else scores[order], lists)
 
-    grouped = df.groupby(b_col, sort=False)
-    id1_list = grouped[a_col].apply(lambda s: [int(x) for x in s])
-    out = {"id2": [int(x) for x in id1_list.index], "id1_list": id1_list.to_numpy()}
-    if score:
-        out["blocking_scores"] = grouped[score].apply(lambda s: [float(x) for x in s]).to_numpy()
+
+def _grouped(a, b, scores, lists):
+    codes, keys = pd.factorize(b, sort=False)
+    order = np.argsort(codes, kind='stable')
+    cuts = np.cumsum(np.bincount(codes, minlength=len(keys)))[:-1]
+    out = {'id2': [int(x) for x in keys],
+           'id1_list': [part.tolist() for part in
+                        np.split(np.asarray(a[order], dtype=np.int64), cuts)]}
+    if scores is not None:
+        out[lists[1]] = [part.tolist() for part in
+                         np.split(np.asarray(scores[order], dtype=np.float64), cuts)]
     return pd.DataFrame(out).reset_index(drop=True)
 
 
 def candidates_from_result(result, sort_by_score: bool = True) -> pd.DataFrame:
     """Return the pairs of a blocker result grouped into one row per record of table B,
     without building the flat table."""
-    groups: dict[int, tuple[list, list]] = {}
-    for a_ids, b_ids, scores in result.iter_pairs():
-        a_list = a_ids.tolist()
-        b_list = b_ids.tolist()
-        s_list = scores.tolist()
-        for i in range(len(b_list)):
-            bucket = groups.get(b_list[i])
-            if bucket is None:
-                bucket = ([], [])
-                groups[b_list[i]] = bucket
-            bucket[0].append(int(a_list[i]))
-            bucket[1].append(float(s_list[i]))
-
-    if not groups:
+    parts = [(np.asarray(a, np.int64), np.asarray(b, np.int64), np.asarray(s, np.float64))
+             for a, b, s in result.iter_pairs()]
+    if not parts or not sum(len(b) for _, b, _ in parts):
         return pd.DataFrame({"id2": [], "id1_list": [], "blocking_scores": []})
-
-    id2, id1_list, scores = [], [], []
-    for b_id, (a_list, s_list) in groups.items():
-        if sort_by_score and len(s_list) > 1:
-            order = sorted(range(len(s_list)), key=lambda i: s_list[i], reverse=True)
-            a_list = [a_list[i] for i in order]
-            s_list = [s_list[i] for i in order]
-        id2.append(int(b_id))
-        id1_list.append(a_list)
-        scores.append(s_list)
-
-    return pd.DataFrame({"id2": id2, "id1_list": id1_list, "blocking_scores": scores})
+    a = np.concatenate([p[0] for p in parts])
+    b = np.concatenate([p[1] for p in parts])
+    scores = np.concatenate([p[2] for p in parts])
+    del parts
+    if sort_by_score:
+        codes, _ = pd.factorize(b, sort=False)
+        order = np.lexsort((-scores, codes))
+        a, b, scores = a[order], b[order], scores[order]
+    return _grouped(a, b, scores, ['id1_list', 'blocking_scores'])
 
 
 def write_flat_candidates(result, path, chunk_rows: int = 8_000_000) -> int:

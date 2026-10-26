@@ -1,12 +1,13 @@
 """The `Feature` base class and the features computed from whole strings and numbers."""
 
+from ..frames import AttrsByRef
 from ..numeric import parse_number
 from abc import abstractmethod, ABC
 from functools import partial
+import numba as nb
 import pandas as pd
 import numpy as np
 from ..utils import SparseVec, is_null, get_logger
-from py_stringmatching import Levenshtein, NeedlemanWunsch, SmithWaterman
 
 log = get_logger(__name__)
 
@@ -40,6 +41,88 @@ def materialize_arrow_columns(recs):
             out[name] = [None if v is None else np.asarray(v, dtype=np.int64)
                          for v in lst.to_pylist()]
     out.attrs['_mf_arrow'] = {}
+    return out
+
+
+def _code_points(s):
+    return np.frombuffer(s.encode('utf-32-le', 'surrogatepass'), dtype=np.uint32)
+
+
+@nb.njit(cache=False)
+def _levenshtein(a, b):
+    n, m = len(a), len(b)
+    if n == 0:
+        return m
+    if m == 0:
+        return n
+    prev = np.arange(m + 1, dtype=np.int64)
+    cur = np.empty(m + 1, dtype=np.int64)
+    for i in range(n):
+        cur[0] = i + 1
+        ca = a[i] & 0xFF
+        for j in range(m):
+            sub = prev[j] + (0 if ca == (b[j] & 0xFF) else 1)
+            cur[j + 1] = min(cur[j] + 1, prev[j + 1] + 1, sub)
+        prev, cur = cur, prev
+    return prev[m]
+
+
+@nb.njit(cache=False)
+def _smith_waterman(a, b, gap):
+    m = len(b)
+    prev = np.zeros(m + 1)
+    cur = np.zeros(m + 1)
+    best = 0.0
+    for i in range(len(a)):
+        cur[0] = 0.0
+        for j in range(m):
+            match = prev[j] + (1.0 if a[i] == b[j] else 0.0)
+            v = max(0.0, match, prev[j + 1] - gap, cur[j] - gap)
+            cur[j + 1] = v
+            if v > best:
+                best = v
+        prev, cur = cur, prev
+    return best
+
+
+@nb.njit(cache=False)
+def _needleman_wunsch(a, b, gap):
+    m = len(b)
+    prev = np.empty(m + 1)
+    cur = np.empty(m + 1)
+    for j in range(m + 1):
+        prev[j] = -(j * gap)
+    for i in range(len(a)):
+        cur[0] = -((i + 1) * gap)
+        for j in range(m):
+            match = prev[j] + (1.0 if a[i] == b[j] else 0.0)
+            cur[j + 1] = max(match, prev[j + 1] - gap, cur[j] - gap)
+        prev, cur = cur, prev
+    return prev[m]
+
+
+def _edit_similarity(x, y):
+    if x == y:
+        return 1.0
+    longest = max(len(x), len(y))
+    return 1 - _levenshtein(_code_points(x), _code_points(y)) / longest
+
+
+def _smith_waterman_score(x, y):
+    return _smith_waterman(_code_points(x), _code_points(y), 1.0)
+
+
+def _needleman_wunsch_score(x, y):
+    return _needleman_wunsch(_code_points(x), _code_points(y), 1.0)
+
+
+def _own(recs, columns):
+    names = [name for name, _ in columns]
+    arrow = recs.attrs.get('_mf_arrow') or {}
+    kept = {k: arrow[k] for name in names
+            for k in (name, name + '#idx', name + '#val') if k in arrow}
+    out = recs[[name for name in names if name in recs.columns]]
+    out.attrs = {'_mf_arrow': AttrsByRef(kept)}
     return out
 
 
@@ -104,8 +187,8 @@ class Feature(ABC):
     def pairs_call(self, a_frame, a_local, b_frame, b_local) -> np.ndarray:
         """Return the value for each pair, given two record frames and the row of each
         pair in them."""
-        a = materialize_arrow_columns(a_frame).iloc[a_local]
-        b = materialize_arrow_columns(b_frame).iloc[b_local]
+        a = materialize_arrow_columns(_own(a_frame, self.stored_columns('a'))).iloc[a_local]
+        b = materialize_arrow_columns(_own(b_frame, self.stored_columns('b'))).iloc[b_local]
         return self.batch_call(a, b)
 
     @abstractmethod
@@ -259,7 +342,7 @@ class RelDiffFeature(Feature):
 class EditDistanceFeature(Feature):
     """Case-insensitive edit distance of two strings."""
     
-    _func = Levenshtein().get_sim_score
+    _func = staticmethod(_edit_similarity)
 
     def _preprocess_output_column(self, for_table_a):
         return None
@@ -283,7 +366,7 @@ class EditDistanceFeature(Feature):
 class NeedlemanWunschFeature(Feature):
     """Case-insensitive Needleman-Wunsch score of two strings."""
     
-    _func = NeedlemanWunsch().get_raw_score
+    _func = staticmethod(_needleman_wunsch_score)
 
     def _preprocess_output_column(self, for_table_a):
         return None
@@ -315,7 +398,7 @@ class NeedlemanWunschFeature(Feature):
 class SmithWatermanFeature(Feature):
     """Case-insensitive Smith-Waterman score of two strings."""
     
-    _func = SmithWaterman().get_raw_score
+    _func = staticmethod(_smith_waterman_score)
 
     def _preprocess_output_column(self, for_table_a):
         return None

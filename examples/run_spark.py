@@ -38,7 +38,7 @@ model = iris.SKLearnModel(XGBClassifier, nan_fill=0.0, eval_metric='logloss',
                           objective='binary:logistic', max_depth=6, seed=42)
 labeled = iris.label_al(model, 'batch', labeler, pool, seeds, checkpoint_path=CHECKPOINT,
                         batch_size=10, max_iter=50)
-# -> pandas.DataFrame          id1, id2, feature_vectors, label, labeled_in_iteration
+# -> pyspark.sql.DataFrame     id1, id2, feature_vectors, label, labeled_in_iteration
 
 matcher = iris.train_matcher(model, labeled)
 predictions = iris.apply_matcher(matcher, fvs, 'feature_vectors', 'prediction', 'confidence')

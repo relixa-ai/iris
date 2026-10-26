@@ -3,18 +3,20 @@ engines."""
 import numpy as np
 
 from . import recpack
+from .utils import token_cache
 
 PREPROCESS_ROWS = 2_000
 
 
 def preprocess(frame, features, for_a, for_b):
     """Return every feature's preprocessing of a frame of text records."""
-    if for_a:
-        for f in features:
-            frame = f.preprocess(frame, True)
-    if for_b:
-        for f in features:
-            frame = f.preprocess(frame, False)
+    with token_cache(frame):
+        if for_a:
+            for f in features:
+                frame = f.preprocess(frame, True)
+        if for_b:
+            for f in features:
+                frame = f.preprocess(frame, False)
     return frame
 
 
@@ -30,9 +32,10 @@ def pack_rows(frame, layout, features, for_a, for_b):
 def feature_matrix(features, a_frame, a_local, b_frame, b_local, fill_na):
     """Return the feature vector of each pair as a row of a float32 matrix, computed on
     record frames."""
-    f_mat = np.stack(
-        [np.asarray(f.pairs_call(a_frame, a_local, b_frame, b_local), dtype=np.float64)
-         for f in features], axis=-1).astype(np.float32)
+    f_mat = np.empty((len(a_local), len(features)), np.float32)
+    for j, f in enumerate(features):
+        f_mat[:, j] = np.asarray(f.pairs_call(a_frame, a_local, b_frame, b_local),
+                                 dtype=np.float64)
     if fill_na is not None:
         np.nan_to_num(f_mat, copy=False, nan=fill_na)
     return f_mat

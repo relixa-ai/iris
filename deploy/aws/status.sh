@@ -8,7 +8,7 @@ aws ec2 describe-instances --filters Name=tag:Project,Values="$CLUSTER" \
   --output table
 if [ -f .cluster ]; then
   source ./.cluster
-  ssh -i "$KEY_FILE" -o ConnectTimeout=10 ubuntu@"$DRIVER_PUBLIC" "curl -fsS localhost:8080/json/" \
+  ssh -i "$KEY_FILE" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 ubuntu@"$DRIVER_PUBLIC" "curl -fsS localhost:8080/json/" \
     2>/dev/null | python3 -c 'import json,sys; m=json.load(sys.stdin); print(
       "master %s: %d workers, %d cores, %d GiB; running apps: %d" % (m["url"],
       m["aliveworkers"], m["cores"], m["memory"] // 1024, len(m["activeapps"])))' || true

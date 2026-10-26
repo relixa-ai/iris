@@ -49,13 +49,23 @@ def validate_table(df, name):
             f"{name} '_id' must be non-negative; {r['n_negative']} negative id(s), e.g. ids "
             f"{neg}")
     if r['n_distinct'] < r['n_nonnull']:
-        dups = (df.groupBy('_id').count().filter(F.col('count') > 1)
-                  .limit(5).collect())
         raise ValueError(
             f"{name} '_id' must be unique; "
             f"{r['n_nonnull'] - r['n_distinct']} duplicate row(s), e.g. ids "
-            f"{[d['_id'] for d in dups]}")
+            f"{_repeated_ids(df)}")
     return r['n']
+
+
+def _repeated_ids(df, n=5):
+    return [r['_id'] for r in df.groupBy('_id').count().filter(F.col('count') > 1)
+            .select('_id').orderBy('_id').limit(n).collect()]
+
+
+def check_unique_ids(df, name):
+    """Raise an error when an id repeats in the `_id` column of a Spark table."""
+    r = df.agg(F.count('_id').alias('n'), F.count_distinct('_id').alias('d')).head()
+    if r['d'] < r['n']:
+        raise ValueError(f"{name} '_id' must be unique; e.g. ids {_repeated_ids(df)} repeat")
 
 
 def check_membership(ids_df, table, table_name, id_col, what):

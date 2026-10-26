@@ -1,6 +1,6 @@
 ## Iris tutorial
 
-This tutorial shows how to use Iris in eight parts. Each part is built around a script in the `examples` directory. We recommend that you go through the parts in order, since each part uses what the previous ones introduced. Before starting, install Iris by following [the installation page](installation/README.md). Parts 1 to 6 give the functions pandas DataFrames or Arrow datasets, so they run on the *local engine*, which uses Python processes on this machine and needs neither Spark nor Java. Parts 7 and 8 give them Spark DataFrames, so they run on the *Spark engine*, which needs Java 17 and Iris installed with Spark support, an optional part of Iris that adds PySpark.
+This tutorial shows how to use Iris in eight parts. Each part is built around a script in the `examples` directory. We recommend that you go through the parts in order, since each part uses what the previous ones introduced. Before starting, install Iris by following [the installation page](installation/README.md). Parts 1 to 6 give the functions pandas DataFrames or Arrow datasets, so they run on the *local engine*, which uses Python processes on this machine. Parts 7 and 8 give them Spark DataFrames, so they run on the *Spark engine*, which needs Java 17 and Iris installed with Spark support, an optional part of Iris that adds PySpark.
 
 A matcher is trained on *labels*, which are pairs marked match (1.0) or non-match (0.0). Labels come from one of four sources.
 
@@ -11,12 +11,13 @@ A matcher is trained on *labels*, which are pairs marked match (1.0) or non-matc
 
 The pairs to label are selected either by you or by *active learning*, in which Iris trains a matcher on the labels collected so far, asks for labels on the pairs the matcher is least certain about, and repeats. Active learning is introduced in Part 4.
 
-The tutorial uses two datasets, which are included with Iris in the `data` directory.
+Three datasets are included with Iris, in the `data` directory. The tutorial uses the first two.
 
 | Dataset | What it is | Size |
 | --- | --- | --- |
-| `data/dblp_acm` | Two tables of computer-science papers, DBLP (2,616 rows) and ACM (2,294 rows), with a candidate set of 114,700 pairs from a blocker, a gold set of the 2,220 pairs known to be the same paper, and a file of 550 labeled pairs. | 1.2 MB |
-| `data/music_1m` | One table of 1,000,000 songs that contains duplicates, with the 33,174,998 candidate pairs produced by blocking the table against itself, and a gold set of the 146,011 known duplicate pairs. | 119 MB |
+| `data/dblp_acm` | Two tables of computer-science papers, DBLP (2,616 rows) and ACM (2,294 rows), with a candidate set of 114,700 pairs from a blocker, a gold set of the 2,220 pairs known to be the same paper, and a file of 550 labeled pairs. | 1.3 MB |
+| `data/music_1m` | One table of 1,000,000 songs that contains duplicates, with the 33,174,998 candidate pairs produced by blocking the table against itself, and a gold set of the 146,011 known duplicate pairs. | 128 MB |
+| `data/abt_buy` | Two tables of electronics products as two stores list them, Abt (1,081 rows) and Buy (1,092 rows), with a gold set of the 1,097 pairs known to be the same product, and a file of 550 labeled pairs. The [quick start](https://www.relixa.ai/quick-start) on the Relixa website uses it. | 249 KB |
 
 The numbers below were obtained on a Mac with 18 cores and 48 GB of memory. The counts are the same on any machine. The precision, recall and F1 can differ slightly on another machine, because active learning can choose differently between pairs whose uncertainty differs only in the last digits of a floating-point number. The running times will differ. Run every script from the `iris` directory, which holds the downloaded repository, after activating the Python environment that the installer created:
 
@@ -72,8 +73,8 @@ The table below explains each call.
 | Call | Returns | What it does |
 | --- | --- | --- |
 | `read_table(path)` | `pandas.DataFrame` | Reads a table into memory. A table has an integer id column, `_id`. A file whose id column has another name is read with `id_col`, which renames it. |
-| `read_pairs(path)` | `pandas.DataFrame` | Reads a set of pairs into memory, as the columns `id1` and `id2`, which hold an `_id` of table A and of table B. The id columns `a_id` and `b_id`, and the other names that blockers give them, are recognised, and `columns` names the file's id columns when they have names that are not recognised. The labeled pairs are stored in the grouped form, with one row per record of B, and `read_pairs` turns them into one row per pair, with `with_label=True` reading their labels. |
-| `check_tables`, `check_candidates`, `check_gold_data`, `check_labeled_data` | a count of rows or pairs | Check the ids before any work starts, and raise an error that names the invalid ones. |
+| `read_pairs(path)` | `pandas.DataFrame` | Reads a set of pairs into memory, as the columns `id1` and `id2`, which hold an `_id` of table A and of table B. The id columns `a_id` and `b_id`, and the other names that blockers give them, are recognized, and `columns` names the file's id columns when they have names that are not recognized. The labeled pairs are stored in the grouped form, with one row per record of B, and `read_pairs` turns them into one row per pair, with `with_label=True` reading their labels. |
+| `check_tables`, `check_candidates`, `check_gold_data`, `check_labeled_data` | the counts of rows or pairs checked | Check the ids before any work starts, and raise an error that names the invalid ones. |
 | `create_features(table_a, table_b, columns, columns)` | `list[Feature]` | Selects the features for the four columns, 35 in all. Part 2 describes them. |
 | `featurize(features, table_a, table_b, pairs)` | `pandas.DataFrame` | Computes the feature vector and the score of each pair, in the columns `feature_vectors` and `score`. It is called twice, for the 550 labeled pairs and for the 114,700 candidate pairs. |
 | `SKLearnModel(XGBClassifier, ...)` | `SKLearnModel` | Creates an untrained matcher from a classifier class of scikit-learn's interface and its arguments. |
@@ -111,7 +112,7 @@ with the extra tokenizers: 107 features
 reloaded 35 features, the same: True
 ```
 
-Every column gets an exact-match feature. The column `year` holds numbers, so it also gets a relative-difference feature, `rel_diff(year, year)`. The columns title, authors and venue each average at least three tokens under the word tokenizer and under the 3-gram tokenizer, so each gets five similarity features per tokenizer: TF/IDF, Jaccard, SIF, overlap coefficient and cosine. That is 1 + 5 + 5 = 11 features for each of the three columns. [How Iris works](how-it-works.md#features) gives the rules.
+Every column gets an exact-match feature. The column `year` holds numbers, so it also gets a relative-difference feature, `rel_diff(year, year)`. The columns `title`, `authors` and `venue` each average at least three tokens under the word tokenizer and under the 3-gram tokenizer, so each gets five similarity features per tokenizer: TF/IDF, Jaccard, SIF, overlap coefficient and cosine. That is 1 + 5 + 5 = 11 features for each of the three columns. [How Iris works](how-it-works.md#features) gives the rules.
 
 The calls of this part are the following:
 
@@ -174,7 +175,7 @@ Enter y[es], n[o], u[nsure], h[elp], or s[top]:
 
 `y` labels the pair a match, `n` a non-match, and `u` unsure. `h` selects which columns are shown. `s` stops the labeling, after a confirmation, and the run continues with the labels collected so far. A pair labeled unsure is kept in the result with the label 2.0, and `train_matcher` leaves it out.
 
-With `--web`, `WebUILabeler` shows the pairs on a page in a browser instead, with the same choices as buttons. It needs the browser labeling support of Iris, which is installed with `pip install 'iris[web]'`. When the labeler starts, Streamlit prints the address of the page, http://localhost:8501 by default. Open it in a browser on the same machine.
+With `--web`, `WebUILabeler` shows the pairs on a page in a browser instead, with the same choices as buttons. It needs the browser labeling support of Iris, which is installed with `pip install 'iris[web]'`. When the labeler starts, Streamlit prints the address of the page, `http://localhost:8501` by default. Open it in a browser on the same machine.
 
 Labeling 550 pairs by hand takes time, and the pairs in the file were not selected as the pairs the matcher learns most from. Part 4 lets active learning select the pairs to label.
 
@@ -210,7 +211,7 @@ labeled = iris.label_al(model, 'batch', labeler, pool, seeds, checkpoint_path=CH
 
 The 550 labels that active learning selected hold 255 matches, against 218 in the file of Part 1. The matcher trained on them reaches an F1 of 0.9896.
 
-Every label is written to the checkpoint file as it is collected. When the script is interrupted and run again, labeling resumes from the file. The script deletes the file at its start so that each run begins afresh. In your own runs, keep the file, since it holds the labels a person has given. Without `checkpoint_path`, the file is `active-matcher-training-data.parquet` in the current directory.
+The labels are written to the checkpoint file while they are collected. When the script is interrupted and run again, labeling resumes from the file. The script deletes the file at its start so that each run begins afresh. In your own runs, keep the file, since it holds the labels a person has given. Without `checkpoint_path`, the file is `active-matcher-training-data.parquet` in the current directory.
 
 To label the pairs yourself, replace the `GoldLabeler` with a `CLILabeler` or a `WebUILabeler`, as in Part 3.
 
@@ -250,7 +251,7 @@ labeler = TitleAndYear(table_a, table_b, iris.GoldLabeler(gold))
 | Call | Returns | What it does |
 | --- | --- | --- |
 | `CustomLabeler.__init__(table_a, table_b)` | | Keeps the tables, so that each pair can be looked up by its ids. |
-| `label_pair(row1, row2)` | `float` | Receives the record of A and the record of B of a pair, as dictionaries of their columns, and returns 1.0, 0.0, 2.0 for unsure, or −1.0 to stop. |
+| `label_pair(row1, row2)` | `float` | Receives the record of A and the record of B of a pair, as dictionaries of their columns, and returns 1.0, 0.0, 2.0 for unsure, or -1.0 to stop. |
 
 The labeler is then used with `create_seeds` and `label_al` as in Part 4. Of the 550 labels, 160 came from the rule and the rest from the gold set, so a person would have labeled 390 pairs. The rule labels every pair with equal titles and years as a match. In the candidate set there are 2,016 such pairs, and 41 of them are not in the gold set, so some of the rule's labels disagree with the gold set, and the matcher learns from them too. Precision is 0.9778, against 0.9941 in Part 4. A rule's labels are trusted as they are, so a rule must be one that a person would agree with.
 
@@ -297,7 +298,7 @@ On the tutorial's machine the run took 3 minutes. Iris ran 18 worker processes, 
 
 ### Part 7: The same functions on Spark
 
-`examples/run_spark.py` runs the functions of Part 4 on Spark, with Spark running on this machine only, without a cluster. It needs Iris installed with Spark support, by `bash install.sh --spark`, and Java 17. Run:
+`examples/run_spark.py` runs the functions of Part 4 on Spark, with Spark running on this machine only. It needs Iris installed with Spark support, by `bash install.sh --spark`, and Java 17. Run:
 
 ```bash
 python examples/run_spark.py
@@ -324,18 +325,18 @@ fvs = iris.featurize(features, table_a, table_b, candidates, out=f'{OUT}/fvs.par
 | `read_table(path, df_type='sparkdf')`, `read_pairs(path, df_type='sparkdf')` | `pyspark.sql.DataFrame` | Read an input with the session as a Spark DataFrame, which Spark splits across its tasks. |
 | `featurize(..., out=...)` | `pyspark.sql.DataFrame` | Joins the pairs with the records of A and then of B, featurizes them in Spark's tasks, and writes the feature vectors to `out`. |
 
-The other calls are those of Part 4, unchanged. The labeler runs on the driver, the Python process that runs the script, and `label_al` returns the labels as a pandas DataFrame. `apply_matcher` and `evaluate` run on Spark.
+The other calls are those of Part 4, unchanged. The labeler runs on the driver, the Python process that runs the script, and `label_al` returns the labels as a Spark DataFrame. `apply_matcher` and `evaluate` run on Spark.
 
 Spark prints its own messages as it starts, such as warnings about the host name, before the script's output. Part 8 submits the functions to a cluster.
 
 ### Part 8: A Spark cluster
 
-`examples/run_spark_cluster.py` runs the functions of Part 7 on a Spark cluster. It is submitted to the cluster with `spark-submit`, which starts the script on the driver and the tasks on the workers. Its two arguments name the dataset and a new location for the outputs. On a cluster both are URIs of storage that every machine of the cluster can read and write, such as `s3a://` for Amazon S3, so the machines need no shared file system.
+`examples/run_spark_cluster.py` runs the functions of Part 7 on a Spark cluster. It is submitted to the cluster with `spark-submit`, which starts the script on the driver and the tasks on the workers. Its two arguments name the dataset and a new location for the outputs. On a cluster both are URIs of storage that every machine of the cluster can read and write, such as `s3a://` for Amazon S3.
 
-The script can be tried on one machine first, with `--master 'local[4]'`, which runs Spark on this machine with 4 parallel tasks, and `file://` URIs in place of a cluster and its storage. `spark.log.level=WARN` keeps Spark's log on the terminal to its warnings. Run:
+The script can be tried on one machine first, with `--master 'local[4, 4]'`, which runs Spark on this machine with 4 parallel tasks and up to 4 attempts at each, and `file://` URIs in place of a cluster and its storage. `spark.log.level=WARN` keeps Spark's log on the terminal to its warnings. Run:
 
 ```bash
-spark-submit --master 'local[4]' --conf spark.log.level=WARN examples/run_spark_cluster.py \
+spark-submit --master 'local[4, 4]' --conf spark.log.level=WARN examples/run_spark_cluster.py \
     file://$PWD/data/dblp_acm file://$PWD/examples/out/cluster
 ```
 
@@ -381,7 +382,7 @@ The functions of Iris can be combined in different orders to create a workflow t
 When the result of a run is not as good as expected, the following are the usual causes.
 
 - *Blocking.* A true match that the blocker left out of the candidate set cannot be found.
-- *The labels.* The matcher learns what the labeler says. An inconsistent person trains a worse matcher than a smaller but correct set of labels would.
+- *The labels.* The matcher learns what the labeler says. Labels from an inconsistent person train a worse matcher than a smaller set of correct labels.
 - *The label budget.* The 550 labels of the tutorial were enough for its data. Data on which matches and non-matches look more alike may need more rounds, set with `max_iter`, or a larger pool.
 - *The columns.* A column that is mostly empty, or that does not differ between matches and non-matches, adds noise. Pass only the columns that identify an entity to `create_features`.
 - *The threshold.* Read the curve that `evaluate` returns before changing the threshold. Change it only when the curve shows a higher F1 at another threshold.
@@ -395,7 +396,7 @@ As the tables and the candidate set grow, the workflow does not change, but the 
 ### What your files need
 
 - *An id column.* Both tables need an id column of unique integers. `read_table` reads it as `_id`, and `id_col` names it when it has another name. Every id in the candidate set and the gold set must exist in its table. The `check_*` functions verify this before any work starts and raise an error that names the ids that do not.
-- *Candidate pairs.* A flat set with one column of table A's ids and one of table B's, or the grouped form with one row per record of B and the list of the records of A paired with it. `read_pairs` reads either as `id1` and `id2`. It recognises the id columns `a_id`/`b_id`, `ltable_id`/`rtable_id` and `left_id`/`right_id`, and `columns` names the two id columns when they have other names, as in `read_pairs('out.csv', columns=('product_a', 'product_b'))`. Ids are integers that are not negative. The section [Tables keyed by strings](technical-guide.md#tables-keyed-by-strings) of the technical guide describes how to give a table keyed by strings integer ids.
+- *Candidate pairs.* A flat set with one column of table A's ids and one of table B's, or the grouped form with one row per record of B and the list of the records of A paired with it. `read_pairs` reads either as `id1` and `id2`. It recognizes the id columns `a_id`/`b_id`, `ltable_id`/`rtable_id` and `left_id`/`right_id`, and `columns` names the two id columns when they have other names, as in `read_pairs('out.csv', columns=('product_a', 'product_b'))`. Ids are integers that are not negative. The section [Tables keyed by strings](technical-guide.md#tables-keyed-by-strings) of the technical guide describes how to give integer ids to a table keyed by strings.
 - *Columns to compare.* The columns given to `create_features` must exist in both tables. A column whose values are numbers in at least 90% of the rows is detected as numeric and also gets a relative-difference feature.
 - *Labels, a gold set, or a labeler.* Labeled pairs have two id columns and `label`, with `label` 1.0 for a match, 0.0 for a non-match and 2.0 for a pair labeled unsure, and are read with `read_pairs(path, with_label=True)`. A gold set has two id columns and is read with `read_pairs`. Without either, labels are collected from a person or from code, as in Parts 3 to 5.
 

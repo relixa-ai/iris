@@ -224,12 +224,24 @@ def _split_vec(raw, offsets):
     return idx, val
 
 
+INT32_LIMIT = 2**31 - 1
+
+
+def _offsets32(offsets):
+    if len(offsets) and offsets[-1] > INT32_LIMIT:
+        raise ValueError(
+            f'one column of the packed records decoded together holds {int(offsets[-1]):,} '
+            f'bytes or values, more than the 2 GiB that 32-bit Arrow offsets reach; decode '
+            f'fewer records at a time')
+    return offsets.astype(np.int32)
+
+
 def _null_mask(ln):
     return pa.array(ln < 0)
 
 
 def _list_array(values, elem_offsets, ln, typ):
-    return pa.ListArray.from_arrays(pa.array(elem_offsets.astype(np.int32)),
+    return pa.ListArray.from_arrays(pa.array(_offsets32(elem_offsets)),
                                     pa.array(values, type=typ), mask=_null_mask(ln))
 
 
@@ -247,14 +259,14 @@ def decode_frame(layout, data, starts, ends):
         if kind == 'strset':
             toks, tok_off, n_tok = _strsets(data, o, l)
             strings = pa.StringArray.from_buffers(
-                len(tok_off) - 1, pa.py_buffer(tok_off.astype(np.int32)), pa.py_buffer(toks))
-            arrow[name] = pa.ListArray.from_arrays(pa.array(n_tok.astype(np.int32)),
+                len(tok_off) - 1, pa.py_buffer(_offsets32(tok_off)), pa.py_buffer(toks))
+            arrow[name] = pa.ListArray.from_arrays(pa.array(_offsets32(n_tok)),
                                                    strings, mask=_null_mask(l))
             continue
         raw, offsets = copy_col(data, o, l)
         if kind == 'str':
             validity = pa.array(l >= 0).buffers()[1] if (l < 0).any() else None
-            arr = pa.StringArray.from_buffers(n, pa.py_buffer(offsets.astype(np.int32)),
+            arr = pa.StringArray.from_buffers(n, pa.py_buffer(_offsets32(offsets)),
                                               pa.py_buffer(raw), validity)
             scalar[name] = arr.to_numpy(zero_copy_only=False)
         elif kind == 'f64':

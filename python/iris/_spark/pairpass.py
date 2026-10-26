@@ -9,37 +9,72 @@ import pyspark.sql.types as T
 from pyspark import StorageLevel
 
 from .._core import pool, records, recpack
+from .utils import BATCH_BYTES, MAX_PARTITIONS, PARTITION_BYTES, map_in_arrow
 
 OUT_SCHEMA = T.StructType([T.StructField('id1', T.LongType()),
                            T.StructField('id2', T.LongType()),
                            T.StructField('fv', T.ArrayType(T.FloatType())),
                            T.StructField('score', T.DoubleType())])
 
-PARTITION_BYTES = 64 * 2**20
-
 SCRATCH_MARGIN = 1.5
 
-LARGE_RECORD_BYTES = 6 * 2**10
-BATCH_TARGET_BYTES = 60 * 2**20
+STREAM_KEY_BYTES = 17
 
-OWNED_SESSION_CONF = 'spark.iris.ownedSession'
+OUT_KEY_BYTES = 24
+
+INT32_LIMIT = 2**31 - 1
+
+
+def pieces(ends, limit):
+    """Return the start and end of each run of packed records, in order, whose bytes come
+    to at most `limit`, or a single record."""
+    bounds = np.r_[0, np.asarray(ends, dtype=np.int64)]
+    out, lo, n = [], 0, len(bounds) - 1
+    while lo < n:
+        hi = max(lo + 1, int(np.searchsorted(bounds, bounds[lo] + limit, side='right')) - 1)
+        if bounds[hi] - bounds[lo] > INT32_LIMIT:
+            raise ValueError(
+                f'a packed record of {bounds[hi] - bounds[lo]:,} bytes passes the 2 GiB '
+                f'that one Spark value holds; leave its columns out of the features or '
+                f'shorten their values')
+        out.append((lo, hi))
+        lo = hi
+    return out
 
 
 def build_records(text, layout, features, for_a, for_b):
     """Return every row of a text table preprocessed and packed, as `(_id, rec)`
     rows."""
+    limit = BATCH_BYTES
+
     def pack(batches):
         for batch in batches:
             for ids, data, ends in records.pack_rows(batch.to_pandas(), layout, features,
                                                      for_a, for_b):
-                offsets = np.r_[0, ends].astype(np.int32)
-                recs = pa.BinaryArray.from_buffers(pa.binary(), len(ids),
-                                                   [None, pa.py_buffer(offsets),
-                                                    pa.py_buffer(data)])
-                yield pa.RecordBatch.from_arrays([pa.array(ids), recs],
-                                                 names=['_id', 'rec'])
+                bounds = np.r_[0, ends]
+                for lo, hi in pieces(ends, limit):
+                    offsets = (bounds[lo:hi + 1] - bounds[lo]).astype(np.int32)
+                    recs = pa.BinaryArray.from_buffers(
+                        pa.binary(), hi - lo,
+                        [None, pa.py_buffer(offsets),
+                         pa.py_buffer(data[bounds[lo]:bounds[hi]])])
+                    yield pa.RecordBatch.from_arrays([pa.array(ids[lo:hi]), recs],
+                                                     names=['_id', 'rec'])
 
-    return text.mapInArrow(pack, '_id long, rec binary').persist(StorageLevel.DISK_ONLY)
+    return map_in_arrow(text, pack, '_id long, rec binary').persist(StorageLevel.DISK_ONLY)
+
+
+def _slices(batches, limit):
+    import pyarrow.compute as pc
+
+    for batch in batches:
+        sizes = pc.binary_length(batch.column('rec')).fill_null(0)
+        ends = np.cumsum(sizes.to_numpy(zero_copy_only=False), dtype=np.int64)
+        if not len(ends) or ends[-1] <= limit:
+            yield batch
+            continue
+        for lo, hi in pieces(ends, limit):
+            yield batch.slice(lo, hi - lo)
 
 
 def _binary(arr):
@@ -56,12 +91,13 @@ def _binary(arr):
     return data, offs[:-1].astype(np.int64), offs[1:].astype(np.int64), valid
 
 
-def _merge_and_score(batches, layout_a, layout_b, features, fill_na, positive):
+def _merge_and_score(batches, layout_a, layout_b, features, fill_na, positive,
+                     limit=BATCH_BYTES):
     from .._core.storage import unknown_id_error
 
     cur_id2, cur_blob = None, None
     last_pair = None
-    for batch in batches:
+    for batch in _slices(batches, limit):
         id2 = batch.column('id2').to_numpy(zero_copy_only=False).astype(np.int64)
         tag = batch.column('tag').to_numpy(zero_copy_only=False)
         id1 = batch.column('id1').fill_null(0).to_numpy(zero_copy_only=False).astype(np.int64)
@@ -164,27 +200,18 @@ def check_scratch(spark, stream_bytes):
                     f'need up to {need / 2**30:.1f} GiB')
 
 
-def size_batches(spark, mean_record_bytes):
-    """Set the Arrow batch size so that a worker holds a bounded amount of record
-    data."""
-    from .._core.utils import get_logger
+def mean_records(recs_a, recs_b):
+    """Return the mean bytes of a packed record of each side."""
+    mean_a = float(recs_a.agg(F.avg(F.length('rec'))).head()[0] or 0.0)
+    if recs_b is recs_a:
+        return mean_a, mean_a
+    return mean_a, float(recs_b.agg(F.avg(F.length('rec'))).head()[0] or 0.0)
 
-    if mean_record_bytes <= LARGE_RECORD_BYTES:
-        return
-    rows = max(64, int(BATCH_TARGET_BYTES // mean_record_bytes))
-    key = 'spark.sql.execution.arrow.maxRecordsPerBatch'
-    current = int(spark.conf.get(key, '10000'))
-    if rows >= current:
-        return
-    log = get_logger(__name__)
-    if spark.conf.get(OWNED_SESSION_CONF, 'false') == 'true':
-        spark.conf.set(key, str(rows))
-        log.info(f'pair pass: records average {mean_record_bytes / 2**10:.1f} KB, so Arrow '
-                 f'batches drop to {rows} rows')
-    else:
-        log.warning(f'pair pass: records average {mean_record_bytes / 2**10:.1f} KB; each '
-                    f'worker holds about 3 x {current} of them. Set {key} to about {rows} '
-                    f'to keep that near {3 * BATCH_TARGET_BYTES / 2**20:.0f} MB.')
+
+def stream_row_bytes(mean_a, mean_b, n_features):
+    """Return the bytes of one row of the join's stream: a record and its keys, and the
+    feature vector the pass gives it."""
+    return max(mean_a, mean_b) + STREAM_KEY_BYTES + 4 * n_features + OUT_KEY_BYTES
 
 
 def pair_pass(pairs, recs_a, recs_b, layout_a, layout_b, features, fill_na=0.0,
@@ -199,18 +226,20 @@ def pair_pass(pairs, recs_a, recs_b, layout_a, layout_b, features, fill_na=0.0,
         recs_b.select(F.col('_id').alias('id2'), F.lit(0).cast('byte').alias('tag'),
                       F.lit(None).cast('long').alias('id1'), 'rec'))
     if mean_a is None or mean_b is None:
-        mean_a = recs_a.agg(F.avg(F.length('rec'))).head()[0] or 0.0
-        mean_b = recs_b.agg(F.avg(F.length('rec'))).head()[0] or 0.0
+        mean_a, mean_b = mean_records(recs_a, recs_b)
     n_pairs = pairs.count()
     n_b = recs_b.count()
     stream_bytes = n_pairs * mean_a + n_b * mean_b
     check_scratch(spark, stream_bytes)
-    size_batches(spark, max(mean_a, mean_b))
     parallelism = spark.sparkContext.defaultParallelism
-    parts = int(min(20_000, max(parallelism, math.ceil(stream_bytes / PARTITION_BYTES))))
+    parts = int(min(MAX_PARTITIONS,
+                    max(parallelism, math.ceil(stream_bytes / PARTITION_BYTES))))
+
+    limit = BATCH_BYTES
 
     def run(batches):
-        return _merge_and_score(batches, layout_a, layout_b, features, fill_na, positive)
+        return _merge_and_score(batches, layout_a, layout_b, features, fill_na, positive,
+                                limit)
 
     return (stream.repartition(parts, 'id2')
                   .sortWithinPartitions('id2', 'tag', 'id1')

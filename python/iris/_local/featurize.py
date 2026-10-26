@@ -4,21 +4,31 @@ import atexit
 import os
 import shutil
 import tempfile
+from collections import Counter
 
 import pandas as pd
 
 from .._core.feature.catalog import BuildCache
-from .._core.storage import spill_dir
+from .._core.storage import SPILL_DIR_ENV, scratch_prefix, spill_dir
 from .._core.textform import resolve_timezone
 from .._core.utils import check_driver_collect, get_logger
 from . import candidates as cand_mod
 from .._core import files
-from . import inputs, pairpass, store
+from . import disk, inputs, pairpass, store
 from .vocab import build_vocabularies
 
 log = get_logger(__name__)
 
 _RESULTS = []
+
+PANDAS_ROW_BYTES = 200
+
+STORE_A, STORE_B = 'the record store of table_a', 'the record store of table_b'
+
+PAIRS = 'the candidate pairs'
+
+REMEDY = (f'Set {SPILL_DIR_ENV} to a directory on a larger volume, write the feature '
+          f'vectors to one (out=...), or free space.')
 
 
 def _remove_at_exit(path):
@@ -43,6 +53,7 @@ def build_vocabularies_for(A, B, features, tz, workers=None):
     cache.clear()
 
 
+@disk.disk_step('featurize', REMEDY)
 def featurize(features, A, B, candidates, output_col='feature_vectors', fill_na=0.0,
               validate=True, timezone=None, out=None, workers=None):
     """Return the feature vector and score of every candidate pair, as pandas or as a
@@ -50,6 +61,9 @@ def featurize(features, A, B, candidates, output_col='feature_vectors', fill_na=
     from ..io import ONE_TABLE_MESSAGE
 
     tz = resolve_timezone(timezone)
+    _check_names(A, features, 'table_a', True, B is None)
+    if B is not None:
+        _check_names(B, features, 'table_b', False, True)
     if validate:
         from ..io import check_candidates
         check_candidates(candidates, A, A if B is None else B)
@@ -60,30 +74,38 @@ def featurize(features, A, B, candidates, output_col='feature_vectors', fill_na=
             n_listed, 'featurize with pandas A and B',
             'Pass A and B as Arrow datasets (parquet) to keep the feature vectors on '
             'disk.')
+        _check_room(n_listed, len(features))
     if out is None:
-        out = tempfile.mkdtemp(prefix='iris-fvs-', dir=spill_dir())
+        out = tempfile.mkdtemp(prefix=scratch_prefix('fvs'), dir=spill_dir())
         if not return_pandas:
             _remove_at_exit(out)
+        disk.output(out)
         own_out = True
     else:
         out = files.local_path(os.fspath(out))
         shutil.rmtree(out, ignore_errors=True)
         own_out = False
+    step = disk.current()
+    _plan(step, B is None, n_listed)
     try:
         with inputs.scratch() as tmp:
             build_vocabularies_for(A, B, features, tz, workers)
+            for name, what, table, for_a, for_b in _stores(A, B):
+                step.phase(name, kept=[(store.estimate(table, features, for_a, for_b, tz,
+                                                       what), tmp)])
+            step.begin(STORE_A)
             store_a = store.build(A, features, True, B is None, tz,
                                   os.path.join(tmp, 'store_a'), 'table_a', workers)
+            if B is not None:
+                step.begin(STORE_B)
             store_b = store_a if B is None else store.build(
                 B, features, False, True, tz, os.path.join(tmp, 'store_b'), 'table_b',
                 workers)
-            _check_scratch(n_listed, len(features), out)
-            b_ids = _store_ids(store_b)
+            step.begin(PAIRS)
             pairs_dir = os.path.join(tmp, 'pairs')
             os.makedirs(pairs_dir)
-            parts, repeats, n_self = cand_mod.canonical(candidates, b_ids, pairs_dir,
-                                                        workers, one_table=B is None)
-            del b_ids
+            parts, repeats, n_self = cand_mod.canonical(candidates, pairs_dir, workers,
+                                                        one_table=B is None)
             if validate and B is None and (repeats or n_self):
                 log.warning(ONE_TABLE_MESSAGE.format(n_self=n_self, repeats=repeats))
             elif validate and repeats:
@@ -100,14 +122,43 @@ def featurize(features, A, B, candidates, output_col='feature_vectors', fill_na=
             shutil.rmtree(out, ignore_errors=True)
 
 
-def _store_ids(st):
-    import numpy as np
+def _check_names(table, features, what, for_a, for_b):
+    names = inputs.columns(table)
+    read = {'_id'}
+    if for_a:
+        read |= {f.a_attr for f in features}
+    if for_b:
+        read |= {f.b_attr for f in features}
+    if isinstance(table, pd.DataFrame):
+        read = set(names)
+    repeated = sorted((c for c, n in Counter(names).items() if n > 1 and c in read), key=str)
+    if repeated:
+        raise ValueError(f'{what} has columns of the same name: {repeated}; give each column '
+                         f'its own name')
 
-    parts = [np.fromfile(store._segment_path(st.directory, s['k'], 'ids'), np.int64)
-             for s in st.segments]
-    return np.concatenate(parts) if parts else np.empty(0, np.int64)
+
+def _check_room(n_pairs, n_features):
+    from .. import resources
+
+    need = n_pairs * (8 * n_features + PANDAS_ROW_BYTES)
+    total_gb, _, source = resources.budget()
+    room = total_gb * 2**30 * resources.SHARE
+    if need > room:
+        raise RuntimeError(
+            f'featurize with pandas A and B would bring {n_pairs:,} feature vectors of '
+            f'{n_features} values into this process, about {need / 2**30:.1f} GiB, more '
+            f'than the {room / 2**30:.1f} GiB Iris plans to use ({source}). Pass A and B '
+            f'as Arrow datasets (parquet) to keep the feature vectors on disk.')
 
 
-def _check_scratch(n_pairs, n_features, out):
-    inputs.require_disk(int(n_pairs * (4 * n_features + 24)), out, 'the feature vectors',
-                        'Write them to a larger volume (out=...), or free space.')
+def _stores(A, B):
+    if B is None:
+        return [(STORE_A, 'table_a', A, True, True)]
+    return [(STORE_A, 'table_a', A, True, False), (STORE_B, 'table_b', B, False, True)]
+
+
+def _plan(step, one_table, n_pairs):
+    for name in [STORE_A] if one_table else [STORE_A, STORE_B]:
+        step.phase(name)
+    step.phase(PAIRS, scratch=[(16 * n_pairs, disk.scratch_root())])
+    step.begin()

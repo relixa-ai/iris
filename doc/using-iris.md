@@ -14,7 +14,7 @@ Iris provides the matching process as a set of Python functions. The functions f
 
 ### How It Works
 
-If you want to start by understanding the conceptual working of Iris, read [How Iris works](how-it-works.md). It describes the matching step, the features, the pool and active learning, the matcher, evaluation, and the two engines that run the functions, one on a single machine without Spark and one on Spark.
+If you want to start by understanding the conceptual working of Iris, read [How Iris works](how-it-works.md). It describes the matching step, the features, the pool and active learning, the matcher, evaluation, and the two engines that run the functions, one on a single machine and one on Spark.
 
 ### Tutorial and Examples
 

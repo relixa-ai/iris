@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, Optional, Callable, Any, Union, Literal
 import pandas as pd
 import numpy as np
+import json
 import pickle
 import os
 import sys
@@ -14,8 +15,9 @@ from ._core import seeds as seed_rules
 from ._core.frames import is_spark
 from ._local.inputs import is_arrow
 from ._core.ml_model import MLModel
-from ._core.utils import get_logger, save_training_data_streaming, load_training_data_streaming
-from ._core.labeler import Labeler, GoldLabeler
+from ._core.utils import (CheckpointWriter, check_writable, get_logger,
+                          load_training_data_streaming)
+from ._core.labeler import Labeler, GoldLabeler, label_of
 from ._core.feature.catalog import (
     get_base_sim_functions,
     get_base_tokenizers,
@@ -167,6 +169,11 @@ def featurize(
     it is given. Passing the same table as `A` and `B` deduplicates that table."""
     if B is A:
         B = None
+    features = list(features)
+    if not features:
+        raise ValueError('featurize was given no features: create_features made none, '
+                         'when every column is mostly null (null_threshold) or none is '
+                         'chosen; pick other columns, or raise null_threshold')
     if is_spark(A) or is_spark(B) or is_spark(candidates):
         from ._spark.featurization import featurize as run
     else:
@@ -304,6 +311,7 @@ def create_seeds(
         from ._spark import steps
         return steps.rows_frame(rows)
 
+    check_writable(checkpoint_path)
     existing_training_data = load_training_data_streaming(checkpoint_path, logger)
     check_training_data_matches(existing_training_data, feature_vector_width(fvs),
                                 checkpoint_path)
@@ -313,9 +321,9 @@ def create_seeds(
     seeds = []
     if existing_training_data is not None:
         logger.warning(
-            f'Resuming from {len(existing_training_data)} labeled examples already in '
-            f'{checkpoint_path!r} -- no new seeds will be created from this fvs. '
-            f'Delete that file or pass checkpoint_path=<new path> to start fresh.')
+            f'Resuming from {len(existing_training_data)} labeled examples in '
+            f'{checkpoint_path!r}; create_seeds keeps them and labels only the seeds still '
+            f'missing. Delete that file or pass checkpoint_path=<new path> to start fresh.')
         if len(existing_training_data) >= nseeds:
             logger.info(f'Already have {len(existing_training_data)} labeled examples, '
                         f'returning existing data')
@@ -328,16 +336,16 @@ def create_seeds(
 
     if isinstance(labeler, GoldLabeler):
         if arrow:
-            if score_column not in fvs.schema.names:
-                from ._local.learn import gold_scores
+            from ._local.learn import any_score, gold_scores
+            if score_column not in fvs.schema.names or not any_score(fvs, score_column):
                 fvs = gold_scores(fvs, labeler, score_column)
         elif return_pandas and (score_column not in fvs.columns or fvs[score_column].isna().all()):
-            gold_pairs = labeler._gold
-            is_gold_mask = [tuple(x) in gold_pairs for x in fvs[['id1', 'id2']].to_numpy()]
+            is_gold_mask = labeler._lookup.contains_many(fvs['id1'].to_numpy(),
+                                                         fvs['id2'].to_numpy())
             fvs = fvs.assign(**{score_column: np.where(is_gold_mask, 1.0, 0.0)})
         elif not return_pandas and score_column not in fvs.columns:
             from ._spark import steps
-            fvs = steps.gold_scores(fvs, labeler._gold, score_column)
+            fvs = steps.gold_scores(fvs, labeler, score_column)
 
     if arrow:
         from ._local.learn import seed_rows
@@ -345,7 +353,7 @@ def create_seeds(
     elif return_pandas:
         n_valid = int(fvs[score_column].notna().sum())
         if nseeds > n_valid:
-            raise ValueError("number of seeds would exceed the size of the fvs DataFrame")
+            raise seed_rules.too_few_scores(nseeds, n_valid, len(fvs), score_column)
         pos_idx, neg_idx = seed_rules.rankings(fvs['id1'], fvs['id2'], fvs[score_column],
                                                nseeds)
         likely_pos = fvs.iloc[pos_idx].to_dict('records')
@@ -354,12 +362,13 @@ def create_seeds(
         from ._spark import steps
         likely_pos, likely_neg = steps.seed_rankings(fvs, score_column, nseeds)
 
-    def checkpoint(row, label):
-        save_training_data_streaming(pd.DataFrame([row]), checkpoint_path, logger)
-
-    new, pos, neg = seed_rules.label_seeds(likely_pos, likely_neg, labeler, nseeds,
-                                           labeled=labeled, pos=pos, neg=neg,
-                                           on_label=checkpoint)
+    writer = CheckpointWriter(checkpoint_path, logger)
+    try:
+        new, pos, neg = seed_rules.label_seeds(likely_pos, likely_neg, labeler, nseeds,
+                                               labeled=labeled, pos=pos, neg=neg,
+                                               on_label=lambda row, label: writer.add(row))
+    finally:
+        writer.flush()
     seeds = seeds + new
     if not seeds:
         raise RuntimeError("No seeds were labeled before stopping")
@@ -375,6 +384,7 @@ def evaluate(
 ) -> dict:
     """Return precision, recall, F1 and a threshold sweep of the predictions against the
     gold pairs."""
+    metrics.check_threshold(threshold)
     if isinstance(predictions, pd.DataFrame):
         pred = predictions['prediction'].to_numpy(np.float64)
         conf = predictions['confidence'].to_numpy(np.float64)
@@ -384,9 +394,18 @@ def evaluate(
             n_gold = tp = 0
             hist = None
         else:
-            g1, g2 = metrics.canonical_gold(gold['id1'], gold['id2'], dedup)
-            n_gold = len(g1)
-            is_gold = metrics.is_member(predictions['id1'], predictions['id2'], g1, g2)
+            from ._local.apply import gold_arrays
+
+            p1 = predictions['id1'].to_numpy(np.int64)
+            p2 = predictions['id2'].to_numpy(np.int64)
+            if len(p1) and len(np.unique(np.stack([p1, p2], axis=1), axis=0)) < len(p1):
+                raise ValueError('the predictions list some pairs more than once; '
+                                 'evaluate counts each pair once, as apply_matcher gives '
+                                 'them')
+            with gold_arrays(gold, dedup) as (g1, g2):
+                n_gold = len(g1)
+                is_gold = metrics.is_member_sorted(predictions['id1'].to_numpy(),
+                                                   predictions['id2'].to_numpy(), g1, g2)
             tp = int((pos & is_gold).sum())
             hist = metrics.histogram(metrics.p_match(pred, conf), is_gold)
     elif is_arrow(predictions):
@@ -395,6 +414,9 @@ def evaluate(
                                                         dedup)
     elif is_spark(predictions):
         from ._spark import steps
+        if isinstance(gold, pd.DataFrame) or is_arrow(gold):
+            from ._local.apply import check_gold_ids
+            check_gold_ids(gold)
         n_gold, n_predicted, tp, hist = steps.evaluate_counts(predictions, gold, threshold,
                                                               dedup)
     else:
@@ -451,6 +473,8 @@ def apply_matcher(
     if is_arrow(df):
         from ._local.apply import apply_matcher as apply
         return apply(model, df, feature_col, prediction_col, confidence_col)
+    if isinstance(df, pd.DataFrame):
+        df = df.copy(deep=False)
     if confidence_col is not None:
         return model.predict_with_confidence(df, feature_col, prediction_col, confidence_col)
     else:
@@ -470,6 +494,7 @@ def label_al(
     """Return labeled pairs collected from the labeler by active learning, in batch or
     continuous mode."""
 
+    check_writable(checkpoint_path)
     if is_spark(fvs):
         from ._spark import steps
         return steps.label_al(model, mode, labeler, fvs, seeds, checkpoint_path,
@@ -486,26 +511,47 @@ def label_pairs(
     """Return the given pairs with the labels the labeler assigns, without active
     learning."""
     stopped = False
-    if is_arrow(pairs):
-        pairs = pairs.to_pandas() if hasattr(pairs, 'to_pandas') else pairs.to_table().to_pandas()
-    if isinstance(pairs, pd.DataFrame):
-        labeled_pairs = []
-        id1_col, id2_col = pairs.columns[0], pairs.columns[1]
+    if isinstance(pairs, pd.DataFrame) or is_arrow(pairs):
+        from ._local import inputs as local_inputs
+
+        cols = local_inputs.columns(pairs)
+        id1_col, id2_col = ('id1', 'id2') if {'id1', 'id2'} <= set(cols) else cols[:2]
+        firsts, seconds, labels = [], [], []
         try:
-            for _, row in pairs.iterrows():
-                label = labeler(row[id1_col], row[id2_col])
-                if label == -1.0:
-                    stopped = True
+            for b in local_inputs.batches(pairs, [id1_col, id2_col]):
+                if not len(b):
+                    continue
+                x, y = b[id1_col].to_numpy(), b[id2_col].to_numpy()
+                if type(labeler) is GoldLabeler:
+                    labeler(x[0], y[0])
+                    found = np.where(labeler._lookup.contains_many(x, y), 1.0, 0.0)
+                    firsts.append(x)
+                    seconds.append(y)
+                    labels.append(found)
+                    continue
+                got = []
+                for a, c in zip(x.tolist(), y.tolist()):
+                    label = label_of(labeler, a, c)
+                    if label == -1.0:
+                        stopped = True
+                        break
+                    got.append(label)
+                firsts.append(x[:len(got)])
+                seconds.append(y[:len(got)])
+                labels.append(np.asarray(got, dtype=object))
+                if stopped:
                     break
-                labeled_pairs.append({
-                    id1_col: row[id1_col],
-                    id2_col: row[id2_col],
-                    'label': label
-                })
-            labeler.finish(len(labeled_pairs), stopped)
+            n_labeled = sum(len(x) for x in labels)
+            labeler.finish(n_labeled, stopped)
         finally:
             labeler.close()
-        labeled_pairs = pd.DataFrame(labeled_pairs)
+        if n_labeled:
+            labeled_pairs = pd.DataFrame({id1_col: np.concatenate(firsts),
+                                          id2_col: np.concatenate(seconds),
+                                          'label': np.concatenate(labels)})
+            labeled_pairs['label'] = labeled_pairs['label'].infer_objects()
+        else:
+            labeled_pairs = pd.DataFrame()
     elif is_spark(pairs):
         from ._spark import steps
         labeled_pairs = steps.label_pairs(labeler, pairs)
@@ -524,19 +570,46 @@ def _files_for(path):
     return files.LocalFiles()
 
 
+FEATURES_MAGIC = b'iris-features\n'
+
+FEATURES_VERSION = 1
+
+
 def save_features(features, path):
     """Write a list of features to `path`, a path or a URI of storage Spark reaches."""
+    from . import __version__
+
     path = os.fspath(path)
     logger.info(f"Saving {len(features)} features to {path}")
-    _files_for(path).write_bytes(path, pickle.dumps(features))
+    head = json.dumps({'version': FEATURES_VERSION, 'iris': __version__}).encode()
+    _files_for(path).write_bytes(path, FEATURES_MAGIC + head + b'\n' + pickle.dumps(features))
     logger.info(f"Successfully saved features to {path}")
 
 
 def load_features(path):
     """Read a list of features written by `save_features`."""
+    from . import __version__
+
     path = os.fspath(path)
     logger.info(f"Loading features from {path}")
-    features = pickle.loads(_files_for(path).read_bytes(path))
+    data = _files_for(path).read_bytes(path)
+    if data.startswith(FEATURES_MAGIC):
+        end = data.find(b'\n', len(FEATURES_MAGIC))
+        try:
+            meta = json.loads(data[len(FEATURES_MAGIC):end]) if end > 0 else None
+        except ValueError:
+            meta = None
+        version = meta.get('version') if isinstance(meta, dict) else None
+        if not isinstance(version, int):
+            raise ValueError(f'{path}: begins as a file of save_features but its description '
+                             f'is damaged; write the features again with save_features')
+        if version > FEATURES_VERSION:
+            raise ValueError(f"{path}: holds features in format {version}, written by Iris "
+                             f"{meta.get('iris')}; this Iris {__version__} reads formats up to "
+                             f'{FEATURES_VERSION}: load them with the Iris that wrote them, or '
+                             f'a later one')
+        data = memoryview(data)[end + 1:]
+    features = pickle.loads(data)
     logger.info(f"Successfully loaded {len(features)} features from {path}")
     return features
 
@@ -568,6 +641,7 @@ def save_predictions(predictions, path, threshold: float = 0.5) -> int:
     """Write the predicted matches, the pairs whose probability of a match is at or above
     `threshold`, to Parquet as `id1`, `id2` and `probability`, and return their number."""
     from .io import parquet_name, _columns
+    metrics.check_threshold(threshold)
     path = parquet_name(path, 'save_predictions')
     missing = [c for c in ('id1', 'id2', 'prediction', 'confidence') if c not in _columns(predictions)]
     if missing:

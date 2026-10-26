@@ -8,12 +8,11 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .._core.storage import spill_dir
+from .._core.storage import scratch_prefix, spill_dir
 from .._core.textform import to_text
 from . import inputs
 from .procpool import atomic_output, run_tasks, workers_for
 
-WORKER_GB = 1.0
 
 
 def _text(column, tz, name):
@@ -22,11 +21,9 @@ def _text(column, tz, name):
     return to_text(column, tz, name).to_pandas()
 
 
-def _normalize_chunk(task, dur_cols, year_cols, concat_cols, int_cols, tz, out_dir):
+def _normalized(table, dur_cols, year_cols, concat_cols, int_cols, tz):
     from ..normalize import duration_seconds, integer_number, year_number
 
-    k, chunk = task
-    table = inputs.read_chunk(chunk, None)
     names = table.column_names
     sources = [c for c in dict.fromkeys([*dur_cols, *year_cols, *int_cols, *concat_cols])
                if c in names]
@@ -47,9 +44,30 @@ def _normalize_chunk(task, dur_cols, year_cols, concat_cols, int_cols, tz, out_d
         joined = [' '.join('' if v is None else v for v in row)
                   for row in zip(*(text[c].tolist() for c in present))]
         table = table.append_column('combined_text', pa.array(joined, pa.string()))
+    return table
+
+
+def _normalize_chunk(task, dur_cols, year_cols, concat_cols, int_cols, tz, out_dir):
+    k, chunk = task
+    rows, writer = 0, None
     with atomic_output(os.path.join(out_dir, f'part-{k:05d}.parquet')) as tmp:
-        pq.write_table(table, tmp)
-    return table.num_rows
+        try:
+            parts = inputs.read_slices(chunk._replace(schema=None), None)
+            for part in parts:
+                table = _normalized(part, dur_cols, year_cols, concat_cols, int_cols, tz)
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp, table.schema)
+                writer.write_table(table)
+                rows += table.num_rows
+            if writer is None:
+                with chunk.filesystem.open_input_file(chunk.path) as fh:
+                    empty = pq.ParquetFile(fh).schema_arrow.empty_table()
+                pq.write_table(_normalized(empty, dur_cols, year_cols, concat_cols,
+                                           int_cols, tz), tmp)
+        finally:
+            if writer is not None:
+                writer.close()
+    return rows
 
 
 def add_normalized_columns(table, dur_cols=(), year_cols=(), concat_cols=(), int_cols=(),
@@ -69,15 +87,17 @@ def add_normalized_columns(table, dur_cols=(), year_cols=(), concat_cols=(), int
                   f'(columns: {[c for c in names if c != "_id"]}); skipping them',
                   flush=True)
     if directory is None:
-        directory = tempfile.mkdtemp(prefix='iris-normalized-', dir=spill_dir())
+        directory = tempfile.mkdtemp(prefix=scratch_prefix('normalized'), dir=spill_dir())
         _remove_at_exit(directory)
     os.makedirs(directory, exist_ok=True)
     with inputs.scratch() as tmp:
-        src = inputs.stage(table, tmp, 'in')
+        workers = workers or workers_for()
+        src = inputs.stage(table, tmp, 'in', workers=workers)
         fn = partial(_normalize_chunk, dur_cols=tuple(dur_cols), year_cols=tuple(year_cols),
                      concat_cols=tuple(concat_cols), int_cols=tuple(int_cols), tz=tz,
                      out_dir=directory)
-        run_tasks(fn, list(enumerate(inputs.chunks(src))), workers or workers_for(WORKER_GB))
+        run_tasks(fn, list(enumerate(inputs.chunks(src, workers=workers))), workers,
+                  task_bytes=inputs.chunk_bytes())
     return inputs.dataset(directory)
 
 

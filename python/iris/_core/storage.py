@@ -1,7 +1,12 @@
 """Scratch files on disk: memory-mapped arrays and the checks on the space they need."""
+import ctypes
+import mmap
 import os
+import re
 import shutil
+import socket
 import tempfile
+import time
 import weakref
 from pathlib import Path
 from tempfile import mkstemp
@@ -28,6 +33,66 @@ def unknown_id_error(bad_ids, side=None):
         f'catch this up front.')
 
 
+_HOST = re.sub(r'[^A-Za-z0-9]', '', socket.gethostname())[:32] or 'host'
+
+_SWEPT = []
+
+SWEEP_AGE_SECONDS = 3600
+
+
+def scratch_prefix(kind):
+    """Return the prefix of a scratch directory or file of this process: its kind, host
+    and process id, by which a later run finds what a killed run left."""
+    return f'iris-{kind}-{_HOST}-{os.getpid()}-'
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def sweep(directory=None):
+    """Remove the scratch directories and files that runs on this host left when they
+    were killed: this user's, unchanged for an hour, whose process has ended."""
+    directory = directory or spill_dir() or tempfile.gettempdir()
+    if directory in _SWEPT:
+        return 0
+    _SWEPT.append(directory)
+    pattern = re.compile(rf'^iris-[a-z]+-{_HOST}-(\d+)-')
+    removed = 0
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return 0
+    uid = os.getuid() if hasattr(os, 'getuid') else None
+    for name in names:
+        found = pattern.match(name)
+        if not found or int(found.group(1)) == os.getpid():
+            continue
+        path = os.path.join(directory, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if (uid is not None and st.st_uid != uid) or \
+                time.time() - st.st_mtime < SWEEP_AGE_SECONDS or _alive(int(found.group(1))):
+            continue
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            _unlink_quietly(path)
+        removed += 1
+    if removed:
+        log.info(f'removed {removed} scratch director{"y" if removed == 1 else "ies"} or '
+                 f'file{"" if removed == 1 else "s"} that killed runs left in {directory}')
+    return removed
+
+
 def spill_dir():
     """Return the directory for scratch files: `IRIS_SPILL_DIR`, else the first
     `spark.local.dir`, else None."""
@@ -52,7 +117,7 @@ def spill_dir():
 
 
 def _mkstemp(suffix):
-    fd, path = mkstemp(suffix=suffix, dir=spill_dir())
+    fd, path = mkstemp(prefix=scratch_prefix('mmap'), suffix=suffix, dir=spill_dir())
     os.close(fd)
     return Path(path)
 
@@ -79,6 +144,49 @@ def _unlink_quietly(path):
         os.unlink(path)
     except OSError:
         pass
+
+
+_libc = None
+
+
+def _c_library():
+    global _libc
+    if _libc is None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mmap.restype = ctypes.c_void_p
+        libc.mmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                              ctypes.c_int, ctypes.c_long)
+        libc.munmap.restype = ctypes.c_int
+        libc.munmap.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
+        _libc = libc
+    return _libc
+
+
+def map_read_only(path, dtype, shape):
+    """Return a read-only array over the file at `path`, mapped and the file closed again,
+    so that the arrays a process maps hold none of its open files."""
+    dtype = np.dtype(dtype)
+    shape = tuple(int(x) for x in np.atleast_1d(shape))
+    n = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+    if os.name != 'posix' or n == 0:
+        return np.memmap(path, mode='r', shape=shape, dtype=dtype)
+    libc = _c_library()
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        size = os.fstat(fd).st_size
+        if size < n:
+            raise ValueError(f'{path} holds {size:,} bytes, fewer than the {n:,} of its array')
+        addr = libc.mmap(None, n, mmap.PROT_READ, mmap.MAP_SHARED, fd, 0)
+    finally:
+        os.close(fd)
+    if addr is None or addr == ctypes.c_void_p(-1).value:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), str(path))
+    buf = (ctypes.c_char * n).from_address(addr)
+    weakref.finalize(buf, libc.munmap, addr, n)
+    arr = np.frombuffer(buf, dtype=dtype).reshape(shape)
+    arr.flags.writeable = False
+    return arr
 
 
 class MemmapArray:
@@ -146,7 +254,7 @@ class MemmapArray:
                 f = self._locate(f.name)
                 if not os.path.exists(f):
                     raise RuntimeError(f'cannot find the memory-mapped file {f}')
-            self._mmap_arr = np.memmap(f, mode='r', shape=self._shape, dtype=self._dtype)
+            self._mmap_arr = map_read_only(f, self._dtype, self._shape)
     
     def delete(self):
         """Close the array and delete its file."""
@@ -158,26 +266,28 @@ class MemmapArray:
 
 class MemmapArrayBuilder:
     """A writer that builds a `MemmapArray` chunk by chunk, without holding the whole
-    array in memory."""
+    array in memory or its file open between writes."""
 
     def __init__(self, n, dtype):
         self._dtype = np.dtype(dtype)
         self._shape = (int(n),)
         self._path = _mkstemp(suffix='.mmap_arr')
         require_free_space(self._shape[0] * self._dtype.itemsize, self._path.parent)
-        self._mmap = np.memmap(self._path, shape=self._shape, dtype=self._dtype, mode='w+')
+        os.truncate(self._path, self._shape[0] * self._dtype.itemsize)
         self._pos = 0
 
     def write(self, chunk):
         """Append `chunk` to the array."""
-        chunk = np.asarray(chunk, dtype=self._dtype)
+        chunk = np.ascontiguousarray(chunk, dtype=self._dtype)
         end = self._pos + len(chunk)
         if end > self._shape[0]:
             raise ValueError(
                 f'MemmapArrayBuilder overflow: allocated {self._shape[0]} elements, '
                 f'received at least {end}'
             )
-        self._mmap[self._pos:end] = chunk
+        with open(self._path, 'r+b') as fh:
+            fh.seek(self._pos * self._dtype.itemsize)
+            fh.write(memoryview(chunk).cast('B'))
         self._pos = end
 
     def finish(self):
@@ -187,8 +297,6 @@ class MemmapArrayBuilder:
                 f'MemmapArrayBuilder underflow: allocated {self._shape[0]} elements, '
                 f'received {self._pos}'
             )
-        self._mmap.flush()
-        del self._mmap
         return MemmapArray.from_file(self._path, self._shape, self._dtype)
 
 

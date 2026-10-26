@@ -111,11 +111,12 @@ def pair_layout(path, names, is_list, columns, with_label):
     raise ValueError(f'{path}: has no columns {list(columns)}; columns: {names}')
 
 
-def read_parquet(spark, path):
+def read_parquet(spark, path, schema=None):
     """Return a Parquet file or directory as a Spark DataFrame, reading dates and
-    timestamps as written."""
-    return (spark.read.option('datetimeRebaseMode', 'CORRECTED')
-                 .option('int96RebaseMode', 'CORRECTED').parquet(path))
+    timestamps as written, and only the columns of `schema` when it is given."""
+    reader = (spark.read.option('datetimeRebaseMode', 'CORRECTED')
+                   .option('int96RebaseMode', 'CORRECTED'))
+    return (reader if schema is None else reader.schema(schema)).parquet(path)
 
 
 def _is_spark(df):

@@ -2,6 +2,7 @@
 the same way by both engines."""
 from __future__ import annotations
 
+import collections
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -97,6 +98,26 @@ def select(hashes, counts, min_doc_freq=1, max_vocab_size=None):
         hashes, counts = hashes[top], counts[top]
     order = np.argsort(hashes, kind='stable')
     return hashes[order], counts[order]
+
+
+def cutoff(histograms, k):
+    """Return the k-th largest document frequency and how many tokens of it each shard keeps,
+    smallest hashes first; None when fewer than k tokens exist."""
+    total = collections.Counter()
+    for hist in histograms:
+        total.update(hist)
+    above = 0
+    for count in sorted(total, reverse=True):
+        if above + total[count] >= k:
+            need = k - above
+            quota = []
+            for hist in histograms:
+                take = min(hist.get(count, 0), need)
+                quota.append(take)
+                need -= take
+            return count, quota
+        above += total[count]
+    return None, None
 
 
 def empty_error(request):

@@ -2,9 +2,9 @@
 
 This guide installs Iris on the machines of a Spark cluster. A cluster has one *master*, which assigns the work, and a number of *workers*, which do it. A script that uses Iris is started with `spark-submit`, which runs the script on a *driver*, here the master machine, and the tasks of each step on the workers. Part 8 of the [tutorial](../tutorial.md) runs such a script.
 
-The data and the outputs of a run are kept on storage that every machine of the cluster can read and write, and are named by URIs, such as `s3a://bucket/path` for Amazon S3 and storage that is compatible with it, or `hdfs://namenode/path` for HDFS. The machines need no shared file system. Each worker needs scratch disk for Spark's *shuffle*, the step in which Spark moves records between machines, which `featurize` uses to bring each candidate pair together with its two records.
+The data and the outputs of a run are kept on storage that every machine of the cluster can read and write, and are named by URIs, such as `s3a://bucket/path` for Amazon S3 and storage that is compatible with it, or `hdfs://namenode/path` for HDFS. Each worker needs scratch disk for Spark's *shuffle*, the step in which Spark moves records between machines, which `featurize` uses to bring each candidate pair together with its two records.
 
-The script `deploy/spark-node.sh` installs one machine. It installs Java 17 and Iris with Spark support in a Python environment. Spark support includes Spark 3.5.3, in the PySpark package, so every machine runs that Spark, at the version Iris requires, with no separate Spark installation. The script then adds the Hadoop library that connects Spark to the storage, such as `hadoop-aws` for S3, configures Spark, and starts the machine as the master or as a worker. It runs on Ubuntu 22.04 or 24.04, on x86 or ARM machines, at any cloud provider or on your own hardware. Everything it installs is under `/opt`, apart from the packages it installs with `apt-get`, and Spark's logs are in `/var/log/spark`.
+The script `deploy/spark-node.sh` installs one machine. It installs Java 17 and Iris with Spark support in a Python environment. Spark support includes Spark 3.5.3, in the PySpark package, so every machine runs that Spark, at the version Iris requires. The script then adds the Hadoop library that connects Spark to the storage, such as `hadoop-aws` for S3, configures Spark, and starts the machine as the master or as a worker. It runs on Ubuntu 22.04 or 24.04, on x86 or ARM machines, at any cloud provider or on your own hardware. Everything it installs is under `/opt`, apart from the packages it installs with `apt-get`, and Spark's logs are in `/var/log/spark`.
 
 This guide was tested on Amazon EC2, with a master of type r6i.2xlarge, two workers of type i4i.2xlarge whose NVMe disks held the shuffle, Ubuntu 24.04 and Amazon S3, started by the scripts in `deploy/aws`. It was also tested with a master and a worker running Ubuntu 24.04 on ARM, in Docker containers, with an S3-compatible store in place of Amazon S3.
 
@@ -62,7 +62,7 @@ The script prints the output of the packages it installs, and its own lines, whi
 
 ```
 [spark-node] Java: openjdk version "17.0.20.1" 2026-08-18
-[spark-node] Iris 0.2.0 with Python 3.12.3 and Spark 3.5.3
+[spark-node] Iris 0.3.0 with Python 3.12.3 and Spark 3.5.3
 [spark-node] storage: s3a
 [spark-node] scratch: /mnt/scratch, 840G free
 [spark-node] master: spark://172.18.0.3:7077 (web UI on port 8080)
@@ -80,7 +80,7 @@ You should see lines like the following:
 
 ```
 [spark-node] Java: openjdk version "17.0.20.1" 2026-08-18
-[spark-node] Iris 0.2.0 with Python 3.12.3 and Spark 3.5.3
+[spark-node] Iris 0.3.0 with Python 3.12.3 and Spark 3.5.3
 [spark-node] storage: s3a
 [spark-node] scratch: /mnt/scratch, 840G free
 [spark-node] worker: joined spark://iris-master:7077 with 18 cores
@@ -103,7 +103,7 @@ The settings of `deploy/spark-node.sh` are the following.
 | `IRIS_SCRATCH_DEVICES` | Blank disks to format and mount at the scratch directory, striped when there are several, or `auto` for every disk that has no partition and no file system. |
 | `IRIS_EXECUTOR_MEMORY` | The memory of each executor. By default 3/8 of the machine's memory. Set it on the master when the workers are a different type of machine. |
 | `IRIS_DRIVER_MEMORY` | The memory of the driver. By default 35% of the machine's memory. |
-| `IRIS_USER` | The account that runs Spark, `ubuntu` by default, else `root`. |
+| `IRIS_USER` | The account that runs Spark. By default `ubuntu` when the machine has that account, and `root` otherwise. |
 | `IRIS_MAX_HOURS` | Shuts the machine down after this many hours, so that a cluster that was not stopped stops costing money. |
 
 The script can be run again on a machine. It reinstalls Iris and the configuration, and starts the master or the worker again.
@@ -117,7 +117,7 @@ On the master, copy the dataset to the storage and submit the cluster example of
 ```
 source /etc/profile.d/iris.sh
 spark-submit --master spark://<master address>:7077 --conf spark.log.level=WARN \
-    run_spark_cluster.py s3a://<bucket>/datasets/dblp_acm s3a://<bucket>/datasets/dblp_acm/runs/1
+    /opt/iris/examples/run_spark_cluster.py s3a://<bucket>/datasets/dblp_acm s3a://<bucket>/datasets/dblp_acm/runs/1
 ```
 
 You should see:

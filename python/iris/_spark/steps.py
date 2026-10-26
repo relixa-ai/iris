@@ -1,6 +1,12 @@
 """The Spark side of the public functions in `iris.tools`."""
+import json
+import numbers
+import re
+
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.dataset as ds
 import pyspark.sql.functions as F
 from pyspark import StorageLevel
 from pyspark.sql import DataFrame as SparkDataFrame
@@ -10,15 +16,20 @@ from pyspark.sql.window import Window
 
 from .._core import pool
 from .._core import seeds as seed_rules
-from .._core.utils import (MAX_DRIVER_ROWS_ENV, convert_arrays_for_spark, get_logger,
+from .._core.utils import (MAX_DRIVER_ROWS_ENV, check_driver_collect,
+                           convert_arrays_for_spark, get_logger,
                            max_driver_rows as _max_driver_rows)
 from .active_learning.cont_entropy_active_learner import ContinuousEntropyActiveLearner
 from .active_learning.ent_active_learner import EntropyActiveLearner
 from .featurization import canonical_pairs
 from .io import as_spark
-from .utils import check_java_version
+from .utils import check_java_version, column, row_bytes
 
 logger = get_logger(__name__)
+
+PANDAS_ROW_BYTES = 200
+
+READ_PIECE_BYTES = 64 * 2**20
 
 
 def clean_candidates(candidates, drop_self_pairs, canonicalize_mirrors):
@@ -45,7 +56,7 @@ def down_sample(fvs, percent, score_column, bucket_size, max_pool_size, seed):
     draw = Window.partitionBy('_b', '_band').orderBy('_r', 'id2', 'id1')
     out = (fvs.withColumn('_b', F.pmod(F.xxhash64('id1', 'id2'), F.lit(B)))
               .filter(F.col('_b') < B_keep)
-              .withColumn('_s', F.coalesce(F.col(score_column).cast('double'),
+              .withColumn('_s', F.coalesce(column(score_column).cast('double'),
                                            F.lit(float('nan'))))
               .withColumn('_band', F.percent_rank().over(rank) <= F.lit(percent))
               .withColumn('_r', F.xxhash64(F.lit(seed).cast('long'), 'id1', 'id2'))
@@ -66,23 +77,51 @@ def rows_frame(rows):
          for k, v in row.items()} for row in rows])
 
 
-def gold_scores(fvs, gold_pairs, score_column):
-    """Return the feature vectors with `score_column` set to 1.0 on gold pairs and 0.0
-    elsewhere."""
-    return fvs.withColumn(score_column,
-        F.when(F.struct('id1', 'id2').isin([F.struct(F.lit(p[0]), F.lit(p[1])) for p in gold_pairs]), 1.0)
-        .otherwise(0.0))
+def _whole_id(value):
+    if not isinstance(value, numbers.Number):
+        return None
+    try:
+        whole = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return whole if whole == value and -2**63 <= whole < 2**63 else None
+
+
+def _gold_ids(lookup):
+    if lookup._a is not None:
+        return lookup._a, lookup._b
+    pairs = [(x, y) for x, y in ((_whole_id(x), _whole_id(y)) for x, y in lookup._pairs)
+             if x is not None and y is not None]
+    id1 = np.fromiter((x for x, _ in pairs), np.int64, count=len(pairs))
+    id2 = np.fromiter((y for _, y in pairs), np.int64, count=len(pairs))
+    order = np.lexsort((id2, id1))
+    return id1[order], id2[order]
+
+
+def gold_scores(fvs, labeler, score_column):
+    """Return Spark feature vectors with `score_column` set to 1.0 on the labeler's gold
+    pairs and 0.0 elsewhere."""
+    id1, id2 = _gold_ids(labeler._lookup)
+    if not len(id1):
+        return fvs.withColumn(score_column, F.lit(0.0))
+    first = np.r_[True, (id1[1:] != id1[:-1]) | (id2[1:] != id2[:-1])]
+    gold = as_spark(pd.DataFrame({'_gold_id1': id1[first], '_gold_id2': id2[first]}),
+                    fvs.sparkSession).withColumn('_gold', F.lit(1.0))
+    on = (fvs['id1'] == gold['_gold_id1']) & (fvs['id2'] == gold['_gold_id2'])
+    return (fvs.join(gold, on, 'left').drop('_gold_id1', '_gold_id2')
+               .withColumn(score_column, F.coalesce(F.col('_gold'), F.lit(0.0)))
+               .drop('_gold'))
 
 
 def seed_rankings(fvs, score_column, nseeds):
     """Return the likely matches and likely non-matches of Spark feature vectors, as row
     dictionaries."""
-    score = F.col(score_column)
+    score = column(score_column)
     valid = fvs.filter(score.isNotNull() & ~F.isnan(score)).persist()
     try:
         n_valid = valid.count()
         if nseeds > n_valid:
-            raise ValueError("number of seeds would exceed the size of the fvs DataFrame")
+            raise seed_rules.too_few_scores(nseeds, n_valid, fvs.count(), score_column)
         k = seed_rules.scan_size(nseeds, n_valid)
         likely_pos = valid.sort(score.desc(), 'id2', 'id1').limit(k) \
                           .toPandas().to_dict('records')
@@ -93,9 +132,41 @@ def seed_rankings(fvs, score_column, nseeds):
     return likely_pos, likely_neg
 
 
+def _gold_frame(gold, spark):
+    if isinstance(gold, SparkDataFrame):
+        return gold
+    if isinstance(gold, pd.DataFrame):
+        return as_spark(gold[['id1', 'id2']], spark)
+    if isinstance(gold, (pa.Table, ds.Dataset)):
+        table = gold.select(['id1', 'id2']) if isinstance(gold, pa.Table) else \
+            gold.to_table(columns=['id1', 'id2'])
+        return as_spark(table.to_pandas(), spark)
+    raise TypeError(f'gold must be a pandas DataFrame, an Arrow table or dataset, or a '
+                    f'Spark DataFrame (got {type(gold)})')
+
+
+def _not_whole(c):
+    return F.isnan(c) | (F.abs(c) == F.lit(float('inf'))) | (c != F.rint(c))
+
+
+def check_gold_ids(gold):
+    """Check that the ids of Spark gold pairs are whole numbers without nulls."""
+    fractional = {n for n, t in gold.dtypes if t in ('float', 'double')}
+    aggs = [F.sum(F.col(n).isNull().cast('long')).alias(f'{n}_null') for n in ('id1', 'id2')]
+    aggs += [F.sum(_not_whole(F.col(n)).cast('long')).alias(f'{n}_bad') for n in fractional]
+    row = gold.agg(*aggs).head().asDict()
+    for name in ('id1', 'id2'):
+        if row[f'{name}_null']:
+            raise ValueError(f"gold '{name}' holds {row[f'{name}_null']} null id(s)")
+        if row.get(f'{name}_bad'):
+            bad = [r[name] for r in gold.filter(_not_whole(F.col(name))).select(name)
+                   .limit(5).collect()]
+            raise ValueError(f"gold '{name}' must hold whole numbers, got {bad}")
+
+
 def evaluate_counts(predictions, gold, threshold, dedup):
     """Return the gold count, the predicted count, the true positives and the
-    probability histogram of Spark predictions."""
+    probability histogram of Spark predictions, against gold pairs of either engine."""
     p_match = F.when(F.col('prediction') == 1.0, F.col('confidence')) \
                .otherwise(F.lit(1.0) - F.col('confidence'))
     pos = (F.col('prediction') == 1.0) if threshold == 0.5 else (p_match >= threshold)
@@ -104,6 +175,9 @@ def evaluate_counts(predictions, gold, threshold, dedup):
         hist = None
         n_predicted = predictions.filter(pos).count()
     else:
+        if isinstance(gold, SparkDataFrame):
+            check_gold_ids(gold)
+        gold = _gold_frame(gold, predictions.sparkSession)
         g = gold.select(F.col('id1').cast('long').alias('id1'),
                         F.col('id2').cast('long').alias('id2'))
         if dedup:
@@ -113,7 +187,7 @@ def evaluate_counts(predictions, gold, threshold, dedup):
         try:
             n_gold = g.count()
             marked = (predictions
-                      .join(F.broadcast(g.withColumn('_g', F.lit(1))), ['id1', 'id2'], 'left')
+                      .join(g.withColumn('_g', F.lit(1)), ['id1', 'id2'], 'left')
                       .select(pos.alias('_pos'), p_match.alias('_p'),
                               F.coalesce(F.col('_g'), F.lit(0)).alias('_g')))
             counts = marked.agg(
@@ -172,11 +246,82 @@ def label_al(model, mode, labeler, fvs, seeds, checkpoint_path, learner_kwargs):
         return spark.createDataFrame(labeled_data)
 
 
-def _read_frame(path, fmt, types):
+_WIDE_DECIMAL = re.compile(r'Decimal precision (\d+) exceeds max precision')
+
+
+def _data_file(fs, path):
+    if not fs.getFileStatus(path).isDirectory():
+        return path
+    for status in sorted(fs.listStatus(path), key=lambda s: s.getPath().getName()):
+        if status.getPath().getName().startswith(('_', '.')):
+            continue
+        found = _data_file(fs, status.getPath())
+        if found is not None:
+            return found
+    return None
+
+
+def _parquet_fields(spark, path):
+    jvm = spark._jvm
+    parquet = jvm.org.apache.parquet
+    conf = spark._jsc.hadoopConfiguration()
+    where = jvm.org.apache.hadoop.fs.Path(path)
+    first = _data_file(where.getFileSystem(conf), where)
+    if first is None:
+        return []
+    reader = parquet.hadoop.ParquetFileReader.open(
+        parquet.hadoop.util.HadoopInputFile.fromPath(first, conf))
+    try:
+        message = reader.getFooter().getFileMetaData().getSchema()
+    finally:
+        reader.close()
+    convert = jvm.org.apache.spark.sql.execution.datasources.parquet \
+        .ParquetToSparkSchemaConverter(spark._jsparkSession.sessionState().conf())
+    fields = []
+    for field in message.getFields():
+        try:
+            one = convert.convert(parquet.schema.MessageType(message.getName(), [field]))
+        except Exception as e:
+            wide = _WIDE_DECIMAL.search(str(e))
+            if wide is None:
+                raise
+            fields.append((field.getName(), None, int(wide.group(1))))
+            continue
+        fields.append((field.getName(), StructType.fromJson(json.loads(one.json()))[0], None))
+    return fields
+
+
+def _read_parquet(spark, path, keep, advice):
+    from ..io import read_parquet
+    try:
+        return read_parquet(spark, path)
+    except Exception as e:
+        found = _WIDE_DECIMAL.search(str(e))
+        if found is None:
+            raise
+    try:
+        fields = _parquet_fields(spark, path)
+    except Exception:
+        fields = []
+    wide = {name: precision for name, _, precision in fields if precision is not None}
+    if not wide:
+        raise ValueError(
+            f'{path}: holds a decimal of precision {found.group(1)}, and Spark reads '
+            f'decimals of at most 38 digits; cast it, for example to a string or a '
+            f'float') from None
+    needed = {n: p for n, p in wide.items() if keep is None or n in keep}
+    if needed:
+        listed = ', '.join(f"'{n}' (precision {p})" for n, p in needed.items())
+        raise ValueError(
+            f'{path}: Spark reads decimals of at most 38 digits, and the decimal '
+            f'column(s) {listed} hold more; {advice}') from None
+    return read_parquet(spark, path, StructType([f for _, f, _ in fields if f is not None]))
+
+
+def _read_frame(path, fmt, types, keep=None, advice=None):
     spark = SparkSession.builder.getOrCreate()
     if fmt == 'parquet':
-        from ..io import read_parquet
-        return read_parquet(spark, path)
+        return _read_parquet(spark, path, keep, advice)
     if fmt == 'jsonl':
         df = spark.read.json(path)
     else:
@@ -184,31 +329,36 @@ def _read_frame(path, fmt, types):
               .option('sep', '\t' if fmt == 'tsv' else ',').csv(path))
     for name, typ in types.items():
         if name in df.columns:
-            df = df.withColumn(name, F.col(f'`{name}`').cast(typ))
+            df = df.withColumn(name, column(name).cast(typ))
     return df
 
 
 def read_table(path, fmt, id_col, columns):
     """Return a table read with Spark, its id column renamed to `_id`."""
     from ..io import table_columns
-    df = _read_frame(path, fmt, {id_col: 'long'})
+    df = _read_frame(path, fmt, {id_col: 'long'},
+                     None if columns is None else [id_col, *columns],
+                     'cast them, for example to a string or a float, or leave them out '
+                     'with columns=')
     attrs = table_columns(path, df.columns, id_col, columns)
-    return df.select(F.col(f'`{id_col}`').alias('_id'), *[F.col(f'`{c}`') for c in attrs])
+    return df.select(column(id_col).alias('_id'), *map(column, attrs))
 
 
 def read_pairs(path, fmt, columns, with_label):
     """Return pairs read with Spark as flat `id1`, `id2` and, with `with_label`, `label`."""
     from ..io import PAIR_ID_NAMES, pair_layout
-    df = _read_frame(path, fmt, {c: 'long' for c in PAIR_ID_NAMES + columns} | {'label': 'double'})
+    df = _read_frame(path, fmt, {c: 'long' for c in PAIR_ID_NAMES + columns} | {'label': 'double'},
+                     {*PAIR_ID_NAMES, *columns, 'id1_list', 'label'},
+                     'cast them, for example to an integer or a float')
     types = dict(df.dtypes)
     grouped, x, y, list_is_a = pair_layout(
         path, df.columns, lambda c: types.get(c, '').startswith('array'), columns, with_label)
     label = [F.col('label').cast('double').alias('label')] if with_label else []
     if not grouped:
-        return df.select(F.col(f'`{x}`').cast('long').alias('id1'),
-                         F.col(f'`{y}`').cast('long').alias('id2'), *label)
-    rows = df.select(F.col(f'`{y}`').alias('_other'),
-                     F.posexplode(F.col(f'`{x}`')).alias('_pos', '_listed'),
+        return df.select(column(x).cast('long').alias('id1'),
+                         column(y).cast('long').alias('id2'), *label)
+    rows = df.select(column(y).alias('_other'),
+                     F.posexplode(column(x)).alias('_pos', '_listed'),
                      *([F.col('label')] if with_label else []))
     listed, other = F.col('_listed').cast('long'), F.col('_other').cast('long')
     ids = [listed.alias('id1'), other.alias('id2')] if list_is_a else [
@@ -221,7 +371,7 @@ def read_pairs(path, fmt, columns, with_label):
 def decided_labels(labeled, label_col):
     """Return the rows labeled match or non-match, the other values of the label column
     apart from unsure, and the numbers of matches and non-matches."""
-    label = F.col(label_col)
+    label = column(label_col)
     counts = {r['v']: r['n'] for r in labeled.groupBy(label.cast('double').alias('v'))
               .count().withColumnRenamed('count', 'n').collect()}
     other = sorted(v for v in counts if v is not None and v not in (0.0, 1.0, 2.0))
@@ -235,10 +385,13 @@ def label_pairs(labeler, pairs):
     stopped = False
     spark = SparkSession.builder.getOrCreate()
     labeled_pairs = []
-    id1_col, id2_col = pairs.columns[0], pairs.columns[1]
+    from .._core.labeler import label_of
+
+    cols = pairs.columns
+    id1_col, id2_col = ('id1', 'id2') if {'id1', 'id2'} <= set(cols) else cols[:2]
     try:
-        for row in pairs.toLocalIterator():
-            label = labeler(row[id1_col], row[id2_col])
+        for row in pairs.select(id1_col, id2_col).toLocalIterator():
+            label = label_of(labeler, row[id1_col], row[id2_col])
             if label == -1.0:
                 stopped = True
                 break
@@ -286,6 +439,10 @@ def save_data(dataframe, path):
                 f"so the write stays parallel, or raise the limit with "
                 f"{MAX_DRIVER_ROWS_ENV}=<n> if the driver really can hold this frame."
             )
+        check_driver_collect(
+            n_rows, f"save_data of '{path_str}'",
+            'Write to a distributed path (hdfs://, s3a://, ...) so the write stays '
+            'parallel.', row_bytes=row_bytes(dataframe) + PANDAS_ROW_BYTES)
         pdf = dataframe.toPandas()
         logger.info(f"Saving pandas DataFrame with shape {pdf.shape} to {path_str}")
         pdf.to_parquet(path_str)
@@ -322,10 +479,38 @@ def load_data(path):
             f"being distributed. Use a distributed path (hdfs://, s3a://, ...) to read "
             f"it in parallel instead."
         )
-        pdf = pd.read_parquet(path_str)
-        logger.info(f"Successfully loaded pandas DataFrame with shape {pdf.shape} from {path_str}")
-        return as_spark(pdf, spark)
+        return _read_on_driver(spark, path_str)
     spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
     dataframe = spark.read.parquet(str(path))
     logger.info(f"Successfully loaded Spark DataFrame from {path}")
     return dataframe
+
+
+def _read_on_driver(spark, path):
+    data = ds.dataset(path, format='parquet')
+    rows = nbytes = 0
+    for frag in data.get_fragments():
+        meta = frag.metadata
+        for k in range(meta.num_row_groups):
+            rows += meta.row_group(k).num_rows
+            nbytes += meta.row_group(k).total_byte_size
+    check_driver_collect(
+        rows, f"load_data of '{path}'",
+        'Read it from a distributed path (hdfs://, s3a://, ...) so that the executors read '
+        'it in parallel.', row_bytes=nbytes / max(rows, 1) + PANDAS_ROW_BYTES)
+    pieces, held, out = [], 0, None
+    for batch in data.to_batches():
+        pieces.append(batch)
+        held += batch.nbytes
+        if held >= READ_PIECE_BYTES:
+            out = _append(out, as_spark(pa.Table.from_batches(pieces).to_pandas(), spark))
+            pieces, held = [], 0
+    if pieces or out is None:
+        table = pa.Table.from_batches(pieces, schema=data.schema)
+        out = _append(out, as_spark(table.to_pandas(), spark))
+    logger.info(f"Successfully loaded {rows} rows from {path} through the driver")
+    return out
+
+
+def _append(out, piece):
+    return piece if out is None else out.unionByName(piece)

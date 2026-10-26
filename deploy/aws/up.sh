@@ -68,6 +68,13 @@ alive() {
 }
 until $SSH test -f /var/lib/iris-ready 2>/dev/null && [ "$(alive)" = "$WORKERS" ]; do
   if [ $SECONDS -gt $DEADLINE ]; then
+    if ! $SSH true 2>/dev/null; then
+      echo "the driver $PUB answers no SSH from this machine. Its security group admits" \
+           "SSH only from the addresses deploy/aws/account.sh added, and this machine's" \
+           "address may have changed: run deploy/aws/account.sh again to admit it, then" \
+           "deploy/aws/status.sh. deploy/aws/down.sh stops the cluster." >&2
+      exit 1
+    fi
     echo "not ready after 25 minutes: $(alive || echo 0) of $WORKERS workers joined." \
          "Each node logs its installation to /var/log/iris-init.log (deploy/aws/ssh.sh" \
          "sudo tail /var/log/iris-init.log); deploy/aws/down.sh stops the cluster." >&2

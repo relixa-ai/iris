@@ -5,6 +5,7 @@ from pyspark.sql import types as T
 from .._core.textform import resolve_timezone
 from ..normalize import duration_seconds, integer_number, year_number
 from .text import text_columns
+from .utils import column
 
 
 def add_normalized_columns(df, dur_cols, year_cols, concat_cols, int_cols, timezone):
@@ -25,7 +26,7 @@ def add_normalized_columns(df, dur_cols, year_cols, concat_cols, int_cols, timez
     suffix = '__iris_text'
     other = [c for c in sources if not isinstance(df.schema[c].dataType, T.StringType)]
     df = text_columns(df, other, tz, suffix=suffix)
-    text = {c: F.col(c + suffix if c in other else c) for c in sources}
+    text = {c: column(c + suffix if c in other else c) for c in sources}
 
     dur_udf = F.pandas_udf(duration_seconds, 'double')
     year_udf = F.pandas_udf(year_number, 'double')
@@ -49,9 +50,9 @@ def add_normalized_columns(df, dur_cols, year_cols, concat_cols, int_cols, timez
 def parse_rates(df, dur_cols, year_cols, sample_rows):
     """Return the fraction of values each parser parsed, over a sample of the Spark
     table."""
-    aggs = [F.mean(F.col(f'{c}_seconds').isNotNull().cast('double')).alias(c)
+    aggs = [F.mean(column(f'{c}_seconds').isNotNull().cast('double')).alias(c)
             for c in dur_cols if f'{c}_seconds' in df.columns]
-    aggs += [F.mean(F.col(f'{c}_numeric').isNotNull().cast('double')).alias(f'{c}_yr')
+    aggs += [F.mean(column(f'{c}_numeric').isNotNull().cast('double')).alias(f'{c}_yr')
              for c in year_cols if f'{c}_numeric' in df.columns]
     if not aggs:
         return {}

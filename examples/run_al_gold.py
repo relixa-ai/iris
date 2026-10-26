@@ -33,7 +33,7 @@ pool = iris.down_sample(fvs, percent=0.3, seed=42)
 labeler = iris.GoldLabeler(gold)
 # -> GoldLabeler  callable(id1, id2) -> 1.0 match, 0.0 non-match; stands in for a person
 seeds = iris.create_seeds(pool, 50, labeler, checkpoint_path=CHECKPOINT)
-# -> pandas.DataFrame   50 rows of the pool with label; saved to the checkpoint as labeled
+# -> pandas.DataFrame   50 rows of the pool with label; saved to the checkpoint while labeled
 
 model = iris.SKLearnModel(XGBClassifier, nan_fill=0.0, eval_metric='logloss',
                           objective='binary:logistic', max_depth=6, seed=42)

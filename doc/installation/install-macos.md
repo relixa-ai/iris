@@ -1,8 +1,8 @@
 ## How to install Iris on macOS
 
-This guide installs Iris on a Mac. On a Mac, Iris runs on its local engine, without Spark or Java. With Spark support installed, it also runs on its Spark engine, with Spark running on the Mac only, without a cluster. All eight parts of the [tutorial](../tutorial.md) run on it.
+This guide installs Iris on a Mac. On a Mac, Iris runs on its local engine. With Spark support installed, it also runs on its Spark engine, with Spark running on the Mac only. All eight parts of the [tutorial](../tutorial.md) run on it.
 
-The installation produces a Python environment, the `.venv` folder, inside the `iris` folder. Nothing is installed system-wide by the installer, and nothing outside the `iris` folder is modified. The prerequisites in Step 1, Python and, for Spark support, Java, are installed separately, before the installer runs.
+The installation produces a Python environment, the `.venv` folder, inside the `iris` folder. The prerequisites in Step 1, Python and, for Spark support, Java, are installed separately, before the installer runs.
 
 This guide was tested on a Mac with Apple silicon running macOS 26.4, with Python 3.12.14 and Java 17.0.20. The build of `py_stringmatching` on an Intel Mac has not been tested.
 
@@ -99,10 +99,10 @@ This command does the following.
 
 - **Checks Python**, the Command Line Tools on an Intel Mac, and, with `--spark`, Java.
 - **Creates the folder `.venv`** inside the `iris` folder, which is a Python environment separate from the system's Python.
-- **Installs Iris and its dependencies** into `.venv` with `pip`, from the Python Package Index ([pypi.org](https://pypi.org)), at the versions listed in `constraints.txt`. The dependencies are NumPy, pandas, PyArrow, SciPy, scikit-learn, XGBoost, Numba, mmh3, py_stringmatching, joblib, threadpoolctl and tqdm, and with `--spark` also PySpark, which contains Spark. Each is a prebuilt package, except `py_stringmatching` on an Intel Mac, which pip builds from source. This step takes a few minutes.
+- **Installs Iris and its dependencies** into `.venv` with `pip`, from the Python Package Index ([pypi.org](https://pypi.org)), at the versions listed in `constraints.txt`. The dependencies are NumPy, pandas, PyArrow, SciPy, scikit-learn, XGBoost, Numba, mmh3, `py_stringmatching`, joblib, threadpoolctl and tqdm, and with `--spark` also PySpark, which contains Spark. Each is a prebuilt package, except `py_stringmatching` on an Intel Mac, which pip builds from source. This step takes a few minutes.
 - **Runs a short test**, `iris smoke`, which creates the features of two small built-in tables, featurizes their 64 pairs, and trains and applies a matcher. With `--spark` it runs the same test on Spark.
 
-It does not use `sudo`, does not ask for your password, and does not modify anything outside the `iris` folder. You should see output like the following, with your own paths. It took 55 seconds on a Mac with Apple silicon.
+You should see output like the following, with your own paths. It took 55 seconds on a Mac with Apple silicon.
 
 ```
 [1/6] checking Python
@@ -110,13 +110,13 @@ It does not use `sudo`, does not ask for your password, and does not modify anyt
 [2/6] checking the build tools
       skipped: every dependency installs from a prebuilt package here
 [3/6] checking Java
-      skipped: the local engine needs no Java (bash install.sh --spark adds Spark)
+      skipped: Java is checked by bash install.sh --spark, which adds Spark support
 [4/6] creating .venv
       OK: .venv/ created with Python 3.12
 [5/6] installing iris and its dependencies with pip, from PyPI (a few minutes)
-      OK: iris 0.2.0 installed
+      OK: iris 0.3.0 installed
 [6/6] smoke test
-iris 0.2.0
+iris 0.3.0
 python    3.12.14
 engine    local, up to 18 worker processes
 features  13
@@ -138,7 +138,7 @@ OK: iris works on this machine.
   └────────────────────────────────────────────────────────┘
 ```
 
-With `--spark`, step 3 prints `OK: Java 17.0.20`, and the smoke test runs a second time on Spark, which prints `java` and `spark` lines and Spark's own startup messages.
+With `--spark`, step `[3/6]` prints `OK: Java 17.0.20`, and the smoke test runs a second time on Spark, which prints `java` and `spark` lines and Spark's own startup messages.
 
 If you see `OK: iris works on this machine.` and the closing box, Iris is installed. Activate the environment and run the first part of the tutorial:
 
@@ -169,9 +169,9 @@ iris info
 | `ERROR: the Xcode Command Line Tools are not installed.` | On an Intel Mac, no compiler is available to build `py_stringmatching`. | `xcode-select --install`, then run the installer again. |
 | `ERROR: no Java runtime found.` | `--spark` was given and Java is not installed. | Install Java 17 as in Step 1. |
 | `ERROR: Java 21.0.5 is not supported by Spark 3.5.` | The default Java is too new for Spark. | Install Java 17 and set `JAVA_HOME` to it: `export JAVA_HOME=$(/usr/libexec/java_home -v 17)`. |
-| `no such file or directory: install.sh` | Terminal is not in the `iris` folder. | Repeat the start of Step 3. |
+| `bash: install.sh: No such file or directory` | Terminal is not in the `iris` folder. | Repeat the start of Step 3. |
 | `command not found: iris` | The environment is not active in this Terminal window. | Run `source .venv/bin/activate` from the `iris` folder. Your prompt then shows `(.venv)`. |
-| Errors mentioning the network, or `Could not find a version` | A package could not be downloaded. | Check the internet connection and run the installer again. Running it twice is safe. |
+| Errors mentioning the network, or `Could not find a version` | A package could not be downloaded. | Check the internet connection and run the installer again. |
 
 ---
 

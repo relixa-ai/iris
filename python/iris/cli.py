@@ -19,7 +19,7 @@ def _cmd_info(args):
     print(f'iris      {__version__}')
     print(f'python    {sys.version.split()[0]}')
     print(f'machine   {total_gb:.1f} GiB, {cores} cores ({source})')
-    print(f'local     up to {workers_for(1.0)} worker processes, scratch in '
+    print(f'local     up to {workers_for()} worker processes, scratch in '
           f'{spill_dir() or tempfile.gettempdir()}')
     try:
         pyspark = importlib.metadata.version('pyspark')
@@ -56,7 +56,7 @@ def _cmd_smoke(args):
             print(f'spark     {spark.version}')
         else:
             from ._local.procpool import workers_for
-            print(f'engine    local, up to {workers_for(1.0)} worker processes')
+            print(f'engine    local, up to {workers_for()} worker processes')
 
         titles = ['deep learning for entity matching', 'a survey of record linkage',
                   'scalable blocking methods', 'probabilistic data integration',

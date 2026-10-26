@@ -12,9 +12,10 @@ from ..._core.learn import SELECTION_STRATEGIES, BatchLearner
 from ..._core.ml_model import normalize_fv_cells
 from ..._core.utils import feature_vector_width, get_logger, type_check
 from ..ml_model import SparkMLModel
-from ..utils import repartition_df
 
 log = get_logger(__name__)
+
+POOL_PART_ROWS = 25_000
 
 
 def _seeded(seed):
@@ -84,7 +85,10 @@ class SparkPool:
     def __init__(self, fvs, model):
         type_check(fvs, 'fvs', pyspark.sql.DataFrame)
         self._spark = SparkSession.builder.getOrCreate()
-        fvs = repartition_df(fvs, 25000, ['id1', 'id2'])
+        n = fvs.count()
+        if n:
+            parts = max(n // POOL_PART_ROWS, 4 * self._spark.sparkContext.defaultParallelism)
+            fvs = fvs.repartition(min(parts, n), 'id1', 'id2')
         self._fvs = model.prep_fvs(fvs).persist(StorageLevel.MEMORY_AND_DISK)
         self._n = None
 

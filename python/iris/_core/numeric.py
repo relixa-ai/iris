@@ -5,8 +5,8 @@ import math
 import re
 
 _WS = r'[ \t\n\r\f\v]*'
-_DECIMAL = r'(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?'
-_HEX = r'0[xX](?:[0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)(?:[pP][+-]?[0-9]+)?'
+_DECIMAL = r'(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?'
+_HEX = r'0[xX](?:[0-9a-fA-F]+(?:\.[0-9a-fA-F]*)?|\.[0-9a-fA-F]+)(?:[pP][+-]?[0-9]+)?'
 _INF = r'[iI][nN][fF](?:[iI][nN][iI][tT][yY])?'
 
 NUMBER = re.compile(rf'{_WS}(?P<sign>[+-]?)(?:(?P<hex>{_HEX})|(?P<dec>{_DECIMAL})|(?P<inf>{_INF})){_WS}')
@@ -22,7 +22,10 @@ def parse_number(value):
             return None
         sign = -1.0 if m.group('sign') == '-' else 1.0
         if m.group('hex') is not None:
-            return sign * float.fromhex(m.group('hex'))
+            try:
+                return sign * float.fromhex(m.group('hex'))
+            except OverflowError:
+                return sign * math.inf
         if m.group('inf') is not None:
             return sign * math.inf
         return sign * float(m.group('dec'))

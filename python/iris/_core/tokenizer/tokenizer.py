@@ -4,9 +4,15 @@ from abc import abstractmethod, ABC
 import re
 import numpy as np
 
+from ..tokenhash import qgram_hashes
 from ..utils import get_logger
 
 log = get_logger(__name__)
+
+def _check_size(n, name):
+    if isinstance(n, bool) or not isinstance(n, (int, np.integer)) or n < 1:
+        raise ValueError(f'{name} takes a whole number of at least 1, got {n!r}')
+
 
 class Tokenizer(ABC):
 
@@ -23,6 +29,11 @@ class Tokenizer(ABC):
         """Return the name of the column that holds the tokens of `input_col`."""
         return f'{str(self)}({input_col})'
     
+    def count_tokens(self, s):
+        """Return the number of tokens of `s`, with repeats, or None."""
+        r = self.tokenize(s)
+        return None if r is None else len(r)
+
     def tokenize_set(self, s):
         """Return the set of tokens of `s`, or None."""
         r = self.tokenize(s)
@@ -57,6 +68,7 @@ class ShingleTokenizer(Tokenizer):
     base_tokenize = StrippedWhiteSpaceTokenizer().tokenize
 
     def __init__(self, n):
+        _check_size(n, 'ShingleTokenizer')
         self._n = n
         self.NAME = f'{self._n}shingle_tokens'
     
@@ -115,6 +127,7 @@ class QGramTokenizer(Tokenizer):
 
     """Lower-cased substrings of length `q`."""
     def __init__(self, n):
+        _check_size(n, 'QGramTokenizer')
         self._q = n
         self.NAME = f'{self._q}gram_tokens'
 
@@ -127,12 +140,29 @@ class QGramTokenizer(Tokenizer):
             return []
         return [s[i:i+self._q] for i in range(len(s) - self._q + 1)]
 
+    def _text(self, s):
+        return s.lower()
+
+    def count_tokens(self, s):
+        """Return the number of tokens of `s`, with repeats, or None."""
+        if not isinstance(s, str):
+            return None
+        return max(0, len(self._text(s)) - self._q + 1)
+
+    def token_hashes(self, s, seed):
+        """Return the hash of every token of `s`, in order, without making the tokens,
+        or None when `s` is not a string."""
+        if not isinstance(s, str):
+            return None
+        return qgram_hashes(self._text(s), self._q, seed)
+
 class StrippedQGramTokenizer(Tokenizer):
     
     """Lower-cased substrings of length `q`, after removing characters other than
     letters and digits."""
     RE = re.compile('\\W+')
     def __init__(self, n):
+        _check_size(n, 'StrippedQGramTokenizer')
         self._q = n
         self.NAME = f'stripped_{self._q}gram_tokens'
     
@@ -148,4 +178,10 @@ class StrippedQGramTokenizer(Tokenizer):
         if len(s) < self._q:
             return []
         return [s[i:i+self._q] for i in range(len(s) - self._q + 1)]
+
+    def _text(self, s):
+        return self._preproc(s).lower()
+
+    count_tokens = QGramTokenizer.count_tokens
+    token_hashes = QGramTokenizer.token_hashes
 

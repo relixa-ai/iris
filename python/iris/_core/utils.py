@@ -9,6 +9,9 @@ import logging
 import pyarrow as pa
 import pyarrow.parquet as pq
 import os
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from math import floor
 
 from . import files
@@ -29,15 +32,41 @@ def max_driver_rows():
         return DEFAULT_MAX_DRIVER_ROWS
 
 
-def check_driver_collect(n_rows, what, remedy):
-    """Raise an error when collecting `n_rows` would exceed the bound on collected
-    rows."""
+def driver_room():
+    """Return the bytes the driving process may collect, and where the figure comes from:
+    its share of the memory budget, or a running Spark driver's heap when smaller."""
+    from .. import resources
+    from .frames import active_spark_context
+
+    total_gb, _, source = resources.budget()
+    room = total_gb * 2**30 * resources.SHARE
+    sc = active_spark_context()
+    if sc is not None and getattr(sc, '_jvm', None) is not None:
+        heap = int(sc._jvm.java.lang.Runtime.getRuntime().maxMemory())
+        if heap < room:
+            return heap, 'the Spark driver heap, spark.driver.memory'
+    return room, source
+
+
+def check_driver_collect(n_rows, what, remedy, row_bytes=None):
+    """Raise an error when collecting `n_rows` would exceed the bound on collected rows,
+    or, given the bytes of a row, the memory of the driver."""
     limit = max_driver_rows()
     if n_rows is not None and n_rows > limit:
         raise RuntimeError(
             f'{what} would move {n_rows:,} rows onto the driver, above the limit of '
             f'{limit:,}. {remedy} Raise the limit with {MAX_DRIVER_ROWS_ENV}=<n> only if '
             f'the driver really can hold this frame.'
+        )
+    if n_rows is None or not row_bytes:
+        return
+    need = n_rows * row_bytes
+    room, source = driver_room()
+    if need > room:
+        raise RuntimeError(
+            f'{what} would move {n_rows:,} rows of about {row_bytes:,.0f} bytes onto the '
+            f'driver, about {need / 2**30:.1f} GiB, more than the {room / 2**30:.1f} GiB '
+            f'the driver may hold ({source}). {remedy}'
         )
 
 
@@ -187,31 +216,56 @@ class PerfectHashFunction:
 TOKEN_HASH_SEED = 0x4D617463
 TOKEN_HASH = PerfectHashFunction(seed=TOKEN_HASH_SEED)
 
-_TOK_MEMO_ATTR = '_mf_tok_memo'
+_TOKEN_CACHE = ContextVar('iris_token_cache', default=None)
+
+
+@contextmanager
+def token_cache(frame):
+    """Keep the token hashes computed for the columns of `frame` until the block ends."""
+    reset = _TOKEN_CACHE.set((frame, {}))
+    try:
+        yield
+    finally:
+        _TOKEN_CACHE.reset(reset)
 
 
 def token_hashes(data, input_col, tokenizer):
     """Return the sorted distinct token hashes and their counts for each record of a
-    column."""
-    memo = data.attrs.get(_TOK_MEMO_ATTR)
-    if memo is None:
-        memo = {}
-        data.attrs[_TOK_MEMO_ATTR] = memo
-
+    column, computed once per column and tokenizer inside `token_cache(data)`."""
+    cache = _TOKEN_CACHE.get()
+    memo = cache[1] if cache is not None and cache[0] is data else None
     key = tokenizer.out_col_name(input_col)
-    hit = memo.get(key)
+    hit = None if memo is None else memo.get(key)
     if hit is None:
         hit = data[input_col].apply(lambda s: _hash_tokens(s, tokenizer))
-        memo[key] = hit
+        if memo is not None:
+            memo[key] = hit
     return hit
 
 
 def _hash_tokens(s, tokenizer):
+    hashes = getattr(tokenizer, 'token_hashes', None)
+    if hashes is not None:
+        h = hashes(s, TOKEN_HASH_SEED)
+        return None if h is None else np.unique(h, return_counts=True)
     toks = tokenizer.tokenize(s)
     if toks is None:
         return None
     h = np.fromiter((TOKEN_HASH.hash(t) for t in toks), dtype=np.int64, count=len(toks))
     return np.unique(h, return_counts=True)
+
+def check_writable(path):
+    """Raise an error now when a local checkpoint at `path` could not be written."""
+    if files.scheme(path) is not None:
+        return
+    directory = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(directory):
+        raise FileNotFoundError(f'the directory of the checkpoint {path!r} does not exist')
+    if not os.access(directory, os.W_OK) or (os.path.exists(path)
+                                             and not os.access(path, os.W_OK)):
+        raise PermissionError(f'the checkpoint {path!r} cannot be written; pass a '
+                              f'checkpoint_path in a directory this process may write to')
+
 
 def save_training_data_streaming(new_batch, checkpoint_path, logger=None):
     """Append a batch of labeled pairs to the labeled-data checkpoint, rewriting the
@@ -248,6 +302,35 @@ def save_training_data_streaming(new_batch, checkpoint_path, logger=None):
     _atomic_write_parquet(out_table, checkpoint_path)
     logger.info(f'{action} {len(new_batch)} labeled pairs '
                 f'({out_table.num_rows} total) in {checkpoint_path}')
+
+
+class CheckpointWriter:
+    """Labeled pairs appended to the labeled-data checkpoint in order, written once the
+    time since the last write is as long as that write took, and on `flush`."""
+
+    def __init__(self, checkpoint_path, logger=None):
+        self._path = checkpoint_path
+        self._logger = logger
+        self._held = []
+        self._written = time.monotonic()
+        self._took = 0.0
+
+    def add(self, row):
+        """Hold a labeled pair, and write the pairs held once the time since the last
+        write is as long as that write took."""
+        self._held.append(row)
+        if time.monotonic() - self._written >= self._took:
+            self.flush()
+
+    def flush(self):
+        """Write the labeled pairs held."""
+        if not self._held:
+            return
+        start = time.monotonic()
+        save_training_data_streaming(pd.DataFrame(self._held), self._path, self._logger)
+        self._held = []
+        self._written = time.monotonic()
+        self._took = self._written - start
 
 
 def load_training_data_streaming(checkpoint_path, logger=None):
